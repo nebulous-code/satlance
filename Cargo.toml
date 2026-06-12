@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/satsurv-core",
+    "crates/satsurv-cli",
+    "crates/notifier-ntfy",
+    "crates/notifier-smtp",
+]
+
+# The four members are SEPARATE DEPLOYABLE UNITS (design doc §4.0/§4.1).
+# They share a workspace only for build convenience; they share NO library
+# code and communicate exclusively over the published HTTP contracts:
+#   - outbox contract  (core <-> notifiers)
+#   - control contract (core <-> control surfaces)
+# Do not introduce a shared crate between them; the contract is JSON on the
+# wire, defined in docs/btc-watch-daemon-design.md §9 / §11.
+
+[profile.release]
+lto = true
+strip = true

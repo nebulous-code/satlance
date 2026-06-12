@@ -1,0 +1,16 @@
+# satsurv-notifier-smtp — stateless delivery unit (plain SMTP to a local relay)
+# Deliberately speaks only unencrypted SMTP: point it at a relay you trust
+# (msmtp, postfix, a compose-local mailhog) and let the relay own TLS.
+
+FROM rust:1.75-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release -p notifier-smtp
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates && rm -rf /var/lib/apt/lists/* && useradd -r notifier
+COPY --from=build /src/target/release/satsurv-notifier-smtp /usr/local/bin/
+USER notifier
+ENTRYPOINT ["satsurv-notifier-smtp"]

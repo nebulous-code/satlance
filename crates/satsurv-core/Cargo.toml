@@ -1,0 +1,35 @@
+[package]
+name = "satsurv-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Sat Surveillance core daemon: detection, state, outbox, HTTP API. Channel-blind."
+license = "MIT"
+
+[[bin]]
+name = "satsurvd"
+path = "src/main.rs"
+
+[dependencies]
+# State store (design §8). System sqlite3 (WAL mode set at open).
+rusqlite = { version = "=0.31.0", features = [] }
+# HTTP API server: small, synchronous, thread-per-request -- fits the
+# single-writer SQLite model and keeps the dependency tree tiny.
+tiny_http = "=0.12.0"
+# JSON on the wire (§11.2 conventions).
+serde = { version = "=1.0.203", features = ["derive"] }
+serde_json = "=1.0.117"
+# ZMQ trigger path (libzmq via system package; design §11 names this crate).
+zmq = "=0.10.0"
+# RPC client (cookie-auth JSON-RPC to Core/Knots). Plain HTTP to localhost.
+ureq = { version = "=2.9.7", default-features = false, features = ["json"] }
+# Capability tokens: HMAC-SHA256 over event id with a daemon-side secret (§10.2).
+hmac = "=0.12.1"
+sha2 = "=0.10.8"
+hex = "=0.4.3"
+# Logging: structured-enough plain text; never echoes xpubs/descriptors/addresses (§10).
+log = "=0.4.21"
+env_logger = { version = "=0.10.2", default-features = false, features = ["humantime"] }
+
+[dev-dependencies]
+tempfile = "=3.10.1"

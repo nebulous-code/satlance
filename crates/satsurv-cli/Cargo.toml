@@ -1,0 +1,17 @@
+[package]
+name = "satsurv-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Sat Surveillance control surface: a thin client over the published control contract (HTTP). Holds no state; the core owns everything."
+license = "MIT"
+
+[[bin]]
+name = "satsurv"
+path = "src/main.rs"
+
+[dependencies]
+# Deliberately the same tiny HTTP stack as the core's RPC client: the CLI is
+# just another consumer of the published contract, not a privileged sibling.
+ureq = { version = "=2.9.7", default-features = false, features = ["json"] }
+serde_json = "=1.0.117"

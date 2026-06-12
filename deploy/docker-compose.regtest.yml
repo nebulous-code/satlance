@@ -1,0 +1,90 @@
+# Sat Surveillance — regtest harness.
+#
+# A disposable, fully local stack for exercising the milestone done-when
+# checks (scripts/regtest-demo.sh drives it). STRICTLY separate from any
+# production node: regtest network, its own volumes, nothing escapes the
+# compose network except the published demo ports on loopback.
+#
+#   docker compose -f deploy/docker-compose.regtest.yml up -d --build
+#
+# Knots users: swap the bitcoind image for one built from Bitcoin Knots
+# (e.g. your own build) — the daemon only needs RPC + the two ZMQ pubs.
+
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:28.1
+    command:
+      - -regtest=1
+      - -server=1
+      - -txindex=0
+      - -fallbackfee=0.0001
+      - -rpcbind=0.0.0.0:18443
+      - -rpcallowip=172.16.0.0/12
+      - -zmqpubrawtx=tcp://0.0.0.0:28332
+      - -zmqpubhashblock=tcp://0.0.0.0:28333
+    volumes:
+      - bitcoind-data:/home/bitcoin/.bitcoin
+    networks: [satnet]
+
+  core:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.core
+    # demo only: run as root so we can read bitcoind's cookie from the shared
+    # volume without uid gymnastics. In production, align uids instead.
+    user: root
+    depends_on: [bitcoind]
+    environment:
+      SATSURV_DB: /var/lib/satsurv/satsurv.db
+      SATSURV_RPC_URL: http://bitcoind:18443
+      SATSURV_RPC_COOKIE: /bitcoin/regtest/.cookie
+      SATSURV_BIND: 0.0.0.0:8330   # refused by satsurvd run unless SATSURV_ALLOW_NONLOOPBACK=1
+      SATSURV_ALLOW_NONLOOPBACK: "1"  # safe here: bound inside the compose network
+      RUST_LOG: info
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until [ -f /bitcoin/regtest/.cookie ]; do echo waiting for bitcoind cookie; sleep 1; done
+        [ -f "$$SATSURV_DB" ] || satsurvd init
+        exec satsurvd run
+    volumes:
+      - satsurv-data:/var/lib/satsurv
+      - bitcoind-data:/bitcoin:ro
+    ports:
+      - "127.0.0.1:8330:8330"
+    networks: [satnet]
+
+  ntfy:
+    image: binwiederhier/ntfy
+    command: serve --listen-http :8338
+    ports:
+      - "127.0.0.1:8338:8338"
+    networks: [satnet]
+
+  notifier:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.notifier-ntfy
+    user: root            # demo only: to read notifier.secret from the shared volume
+    depends_on: [core, ntfy]
+    environment:
+      SATSURV_API: http://core:8330
+      SATSURV_SECRET_FILE: /var/lib/satsurv/notifier.secret
+      NTFY_URL: http://ntfy:8338/satsurv
+      NOTIFIER_LABEL: ntfy
+      NOTIFIER_TIERS: alarm,degraded,heartbeat
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until [ -f /var/lib/satsurv/notifier.secret ]; do sleep 1; done
+        exec satsurv-notifier-ntfy
+    volumes:
+      - satsurv-data:/var/lib/satsurv:ro
+    networks: [satnet]
+
+volumes:
+  bitcoind-data:
+  satsurv-data:
+
+networks:
+  satnet:
