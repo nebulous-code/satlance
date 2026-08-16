@@ -1,0 +1,197 @@
+# Sat Lance — signet soak harness.
+#
+# UNLIKE deploy/docker-compose.regtest.yml, this stack is PERSISTENT and it is
+# meant to run for days. The soak IS the test: real reorgs, a real mempool,
+# realistic block timing, and notifications that reach your actual phone and
+# inbox rather than a throwaway container.
+#
+#   cp deploy/.env.example deploy/.env     # fill it in first
+#   docker compose -f deploy/docker-compose.signet.yml --env-file deploy/.env up -d --build
+#
+# NEVER run `down -v` against this stack — that destroys the soak. Use `stop`
+# and `start` freely; surviving restarts is part of what is being tested.
+#
+# Runbook: docs/signet-soak.md
+
+# Explicit project name. Both compose files live in deploy/, so they would
+# otherwise share the default project ("deploy") and both define a service
+# called `core` — Compose would conflate them and they'd share built images.
+name: satlance-signet
+
+services:
+  bitcoind:
+    # Required, with no default: this repo takes no position on which node
+    # implementation you should run. Set both in deploy/.env — the datadir has
+    # to match what your chosen image expects, or the cookie never appears
+    # where the daemon looks and init waits forever.
+    image: ${SIGNET_NODE_IMAGE:?set SIGNET_NODE_IMAGE in deploy/.env}
+    container_name: satlance-signet-node
+    restart: unless-stopped
+    stop_grace_period: 2m
+    command:
+      - -signet=1
+      - -server=1
+      - -txindex=0
+      - -fallbackfee=0.0001
+      - -rpcbind=0.0.0.0:38332
+      - -rpcallowip=172.16.0.0/12
+      # ZMQ from day one — the trigger path. Your mainnet node has no ZMQ
+      # configured at all, which is one of the two gates that make `init`
+      # refuse it; a fresh node sidesteps that entirely.
+      - -zmqpubrawtx=tcp://0.0.0.0:28332
+      - -zmqpubhashblock=tcp://0.0.0.0:28333
+    volumes:
+      - node-data:${SIGNET_NODE_DATADIR:?set SIGNET_NODE_DATADIR in deploy/.env}
+    networks: [satlance-signet]
+
+  core:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.core
+    container_name: satlance-signet-core
+    restart: unless-stopped
+    # Reads bitcoind's cookie from the shared volume without uid gymnastics.
+    # Production should align uids instead — see the hardening task.
+    user: root
+    depends_on: [bitcoind]
+    environment:
+      SATLANCE_DB: /var/lib/satlance/satlance.db
+      SATLANCE_RPC_URL: http://bitcoind:38332
+      # Same named volume as the node, mounted read-only at a different path.
+      SATLANCE_RPC_COOKIE: /bitcoin/signet/.cookie
+      # The node advertises its BIND address (0.0.0.0); subscribe to the
+      # service name so the trigger path actually works cross-container (R5).
+      SATLANCE_ZMQ_ENDPOINTS: tcp://bitcoind:28332,tcp://bitcoind:28333
+      SATLANCE_BIND: 0.0.0.0:8330
+      SATLANCE_ALLOW_NONLOOPBACK: "1"   # safe: bound inside the compose network
+      RUST_LOG: info
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until [ -f /bitcoin/signet/.cookie ]; do echo "waiting for node cookie"; sleep 2; done
+        # `init` refuses a node still in IBD — correct behaviour, and signet
+        # takes a while to sync. Retry patiently rather than dying.
+        until [ -f "$$SATLANCE_DB" ] || satlanced init; do
+          echo "init refused (node still syncing?) — retrying in 30s"; sleep 30
+        done
+        exec satlanced run
+    volumes:
+      - core-data:/var/lib/satlance
+      - node-data:/bitcoin:ro
+    ports:
+      # 8331 on the host: the regtest harness owns 8330.
+      - "127.0.0.1:8331:8330"
+    networks: [satlance-signet]
+
+  notifier-ntfy:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.notifier-ntfy
+    container_name: satlance-signet-ntfy
+    restart: unless-stopped
+    user: root            # to read notifier.secret from the shared volume
+    depends_on: [core]
+    environment:
+      SATLANCE_API: http://core:8330
+      SATLANCE_SECRET_FILE: /var/lib/satlance/notifier.secret
+      # Your REAL ntfy instance. A soak that pushes to a throwaway container
+      # proves nothing about whether you would actually be woken up.
+      NTFY_URL: ${NTFY_URL}
+      NTFY_TOKEN: ${NTFY_TOKEN:-}
+      NOTIFIER_LABEL: ntfy
+      NOTIFIER_TIERS: alarm,degraded,heartbeat
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until [ -f /var/lib/satlance/notifier.secret ]; do sleep 2; done
+        exec satlance-notifier-ntfy
+    volumes:
+      - core-data:/var/lib/satlance:ro
+    networks: [satlance-signet]
+
+  notifier-smtp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.notifier-smtp
+    container_name: satlance-signet-smtp
+    restart: unless-stopped
+    user: root
+    depends_on: [core, relay]
+    environment:
+      SATLANCE_API: http://core:8330
+      SATLANCE_SECRET_FILE: /var/lib/satlance/notifier.secret
+      # Plain SMTP to the relay, which never leaves the compose network.
+      # The notifier deliberately cannot do STARTTLS; the relay owns TLS.
+      SMTP_HOST: relay
+      SMTP_PORT: "587"
+      SMTP_FROM: ${MAIL_FROM}
+      SMTP_TO: ${MAIL_TO}
+      NOTIFIER_LABEL: smtp
+      NOTIFIER_TIERS: ${SMTP_TIERS:-alarm,degraded}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until [ -f /var/lib/satlance/notifier.secret ]; do sleep 2; done
+        exec satlance-notifier-smtp
+    volumes:
+      - core-data:/var/lib/satlance:ro
+    networks: [satlance-signet]
+
+  relay:
+    # Owns TLS and auth to Zoho so the notifier never sees the credentials
+    # and the password never crosses the wire in the clear.
+    image: boky/postfix:latest
+    container_name: satlance-signet-relay
+    restart: unless-stopped
+    environment:
+      RELAYHOST: "[smtp.zoho.com]:587"
+      RELAYHOST_USERNAME: ${ZOHO_USER}
+      RELAYHOST_PASSWORD: ${ZOHO_PASS}
+      # RELAYHOST_TLS_LEVEL is deprecated in this image; this is its successor.
+      # 'encrypt' means STARTTLS is mandatory — never fall back to cleartext,
+      # which would defeat the entire reason the relay exists.
+      POSTFIX_smtp_tls_security_level: encrypt
+      ALLOW_EMPTY_SENDER_DOMAINS: "true"
+      HOSTNAME: satlance-signet
+    networks: [satlance-signet]
+
+  # One-shot channel test. Never runs during a normal `up` (profile-gated) —
+  # with restart: unless-stopped everywhere, an auto-firing test would push a
+  # message every time the host reboots. Driven by scripts/signet-preflight.sh.
+  preflight:
+    image: curlimages/curl:latest
+    profiles: [preflight]
+    environment:
+      NTFY_URL: ${NTFY_URL}
+      NTFY_TOKEN: ${NTFY_TOKEN:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [satlance-signet]
+    entrypoint: ["sh", "-c"]
+    # Deliberately non-ASCII: R1 was an alarm that could not be delivered
+    # because the title carried a warning sign and an em dash. If this arrives,
+    # that whole class of failure is ruled out for your setup.
+    command:
+      - |
+        set -e
+        BASE="$${NTFY_URL%/*}"
+        TOPIC="$${NTFY_URL##*/}"
+        BODY="{\"topic\":\"$$TOPIC\",\"title\":\"⚠ Sat Lance preflight — em dash and warning sign\",\"message\":\"If you can read this on your phone, the ntfy path is configured correctly.\",\"priority\":4,\"tags\":[\"warning\"]}"
+        if [ -n "$$NTFY_TOKEN" ]; then
+          curl -sf -X POST "$$BASE" -H "Authorization: Bearer $$NTFY_TOKEN" \
+            -H 'Content-Type: application/json' -d "$$BODY" >/dev/null
+        else
+          curl -sf -X POST "$$BASE" -H 'Content-Type: application/json' -d "$$BODY" >/dev/null
+        fi
+        echo "PREFLIGHT_NTFY_POSTED topic=$$TOPIC"
+
+volumes:
+  node-data:
+    name: satlance-signet-node
+  core-data:
+    name: satlance-signet-core
+
+networks:
+  satlance-signet:

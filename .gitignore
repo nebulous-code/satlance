@@ -1,4 +1,7 @@
 /target
+# soak/deploy credentials (Zoho relay password, ntfy token) — never commit
+.env
+deploy/.env
 *.secret
 *.db
 *.db-journal
