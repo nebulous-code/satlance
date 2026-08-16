@@ -16,6 +16,14 @@ use std::path::Path;
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
+    // §10: tight file permissions — the cap-token key lives in `meta`.
+    // Best-effort (the -wal/-shm sidecars inherit the dir; secrets files are
+    // already 0600 from auth::init_secrets).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;

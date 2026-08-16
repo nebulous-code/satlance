@@ -146,9 +146,11 @@ fn handle(mut req: Request, ctx: &Ctx) {
         (Scope::Open, _) => true,
         (Scope::Control, Some(Role::Control)) => true,
         (Scope::Notifier, Some(Role::Notifier)) => true,
-        // control-scope may READ the outbox for display (§11.1) but not ack:
+        // control-scope may READ the outbox display (§11.1) — exactly
+        // GET /outbox, not /outbox/pending (that's the notifier long-poll,
+        // and it side-effects last_seen_at):
         (Scope::Notifier, Some(Role::Control)) => {
-            method == Method::Get && parts.first() == Some(&"outbox")
+            method == Method::Get && parts == ["outbox"]
         }
         _ => false,
     };
@@ -340,14 +342,40 @@ fn get_wallet(ctx: &Ctx, id: &str) -> (u16, Value) {
     }
 }
 
+/// EDGE 4 policy (user decision, 2026-06-12): a wallet with history cannot
+/// be deleted — events/pre-auths are the audit trail and the §13 retention
+/// default keeps them indefinitely. Disarm instead. Only a wallet that never
+/// produced a row can be removed cleanly.
 fn delete_wallet(ctx: &Ctx, id: &str) -> (u16, Value) {
     let id = match parse_id(id) { Ok(i) => i, Err(e) => return e };
     let conn = ctx.conn.lock().unwrap();
+    if wallet_has_history(&conn, id) {
+        return err(
+            409,
+            "wallet_has_history",
+            "this wallet has events/pre-auths/notifications — the audit trail is kept; disarm the wallet instead of deleting it",
+        );
+    }
     let n = conn.execute("DELETE FROM wallet WHERE id=?1", [id]).unwrap_or(0);
     if n == 0 {
         return err(404, "wallet_not_found", "no such wallet");
     }
     (200, json!({"deleted": id}))
+}
+
+/// Any child rows referencing this wallet? (The FK constraints would block
+/// the DELETE anyway; this exists to answer 409 honestly instead of a
+/// misleading failure.)
+fn wallet_has_history(conn: &Connection, wallet_id: i64) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM event   WHERE wallet_id=?1)
+             OR EXISTS(SELECT 1 FROM preauth WHERE wallet_id=?1)
+             OR EXISTS(SELECT 1 FROM outbox  WHERE wallet_id=?1)",
+        [wallet_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n != 0)
+    .unwrap_or(true) // on DB error, refuse rather than half-delete
 }
 
 fn wallet_import(ctx: &Ctx, id: &str, body: &Value) -> (u16, Value) {
@@ -462,7 +490,12 @@ fn post_preauth(ctx: &Ctx, body: &Value) -> (u16, Value) {
     };
     let note = body["note"].as_str();
     let conn = ctx.conn.lock().unwrap();
-    let ttl = body["ttl"].as_i64().unwrap_or_else(|| db::config_get_i64(&conn, "preauth_ttl_secs"));
+    // CONTRACTS.md says `ttl_secs` (matching ack_window_secs); `ttl` is kept
+    // as an alias for older clients.
+    let ttl = body["ttl_secs"]
+        .as_i64()
+        .or_else(|| body["ttl"].as_i64())
+        .unwrap_or_else(|| db::config_get_i64(&conn, "preauth_ttl_secs"));
     let wallet_exists: bool = conn
         .query_row("SELECT 1 FROM wallet WHERE id=?1", [wallet_id], |_| Ok(()))
         .is_ok();

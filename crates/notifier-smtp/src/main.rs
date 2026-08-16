@@ -129,6 +129,9 @@ impl Smtp {
 }
 
 fn send_mail(c: &Cfg, subject: &str, body: &str) -> Result<(), String> {
+    // Header values must be a single line: strip CR/LF and other control
+    // chars so a hostile wallet label can't inject mail headers.
+    let subject: String = subject.chars().filter(|ch| !ch.is_control()).collect();
     let mut s = Smtp::connect(&c.host, c.port)?;
     s.cmd("EHLO satsurv", 2)?;
     if let (Some(u), Some(p)) = (&c.user, &c.pass) {

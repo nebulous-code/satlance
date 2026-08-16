@@ -144,7 +144,7 @@ fn main() {
             while let Some(flag) = it.next() {
                 match (*flag, it.next()) {
                     ("--note", Some(v)) => body["note"] = json!(v),
-                    ("--ttl", Some(v)) => body["ttl"] = json!(v.parse::<i64>().unwrap_or(86400)),
+                    ("--ttl", Some(v)) => body["ttl_secs"] = json!(v.parse::<i64>().unwrap_or(86400)),
                     _ => die_usage(),
                 }
             }

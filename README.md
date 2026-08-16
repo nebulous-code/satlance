@@ -53,6 +53,16 @@ door. Alarms additionally mint a single-use HMAC **capability token** that
 rides only in the alarm payload; silencing an event requires control scope
 *plus* that token.
 
+## Building
+
+Rust 1.75+, plus two system libraries (rusqlite links the system SQLite;
+the `zmq` crate links libzmq):
+
+```
+sudo apt-get install libsqlite3-dev libzmq3-dev pkg-config   # Debian/Ubuntu
+cargo build --release
+```
+
 ## Quick start (against your real node)
 
 Your node needs ZMQ enabled:

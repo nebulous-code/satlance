@@ -511,6 +511,49 @@ The authoritative *from → trigger → to + side-effect* tables. States are def
 | `pending` | `expires_at` passes, never spent | `expired` | re-arm the UTXO; notify "pre-auth lapsed, balance unchanged" |
 | `pending` | `DELETE /preauths/{id}` | `cancelled` | user changed mind; UTXO stays armed |
 
+### 8.7 Edge-case walkthroughs (‹EDGE n› from the tables above)
+
+- **‹EDGE 1› Import/rescan failure → `error`, never limbo.** A failed import
+  (node rejected the descriptor, node lost mid-scan) parks the wallet in
+  `error` with a degraded notice — explicitly NOT PROTECTED, retryable via
+  `/import` or `/rescan`. The trap to avoid: a half-imported wallet that
+  *looks* like it's progressing. Corollary: a wallet is only ever treated as
+  "imported" when the node-side watch wallet actually **contains
+  descriptors** — a blank watch wallet (e.g. left behind by a failed
+  automated import) is evidence of nothing and must never reach `awaiting`,
+  because a blank wallet scans instantly to a confident balance of zero.
+- **‹EDGE 2› Re-arm after a deliberate pause confirms the while-paused
+  delta.** `disarmed → armed` runs a catch-up reconciliation first; if the
+  balance moved while paused, the wallet lands in `awaiting` (confirm the
+  delta) rather than silently `armed`. Resuming protection must not bless a
+  balance the user never saw.
+- **‹EDGE 3› Node loss blinds; recovery is daemon-managed.** `armed →
+  blinded` is involuntary and paired with the daemon-global degraded
+  condition (§7.1) so the per-wallet status and the global notice can't
+  contradict. Recovery (`blinded → armed`) is automatic, runs catch-up
+  reconciliation first, and emits the recovery notice — the user never
+  touches a blinded wallet.
+- **‹EDGE 4› Deleting a wallet with history is refused.** Events,
+  pre-auths, and notifications are the audit trail, and §13 keeps them
+  indefinitely — so `DELETE /wallets/{id}` on a wallet with any child rows
+  is `409 wallet_has_history` ("disarm it instead"). Only a wallet that
+  never produced a row deletes cleanly. No cascade, no orphaning: the
+  trail outlives the watch. *(Decided 2026-06-12.)*
+- **‹EDGE 5› Reorged events re-evaluate, they don't resolve.** `confirmed →
+  reorged` is a holding state: the spend may re-confirm elsewhere (walk back
+  up the confirmation axis) or end up `vanished`. A reorg notice rides the
+  degraded tier — chain weirdness is the guard's health context, not a new
+  theft.
+- **‹EDGE 6› `vanished` closes the alarm — but only a *true* vanish, and
+  never permanently.** A firing event whose spend is conflicted or gone
+  from both wallet and mempool past the timeout auto-resolves (nothing
+  on-chain remains to alarm about). Two guards keep this off-ramp from
+  becoming a silencer: (1) age alone never vanishes a spend that is still
+  alive in the mempool — an attacker can re-broadcast indefinitely; (2) a
+  vanished spend that reappears (re-broadcast or finally mined) **re-opens
+  the alarm** if the close was the daemon's own `auto_resolved` — a human
+  `acknowledged` stands. A closed event must never mask a live theft.
+
 ---
 
 ## 9. Notifications

@@ -40,33 +40,71 @@ const TICK_SECS: u64 = 30;
 pub fn run(conn: Arc<Mutex<Connection>>, rpc: RpcClient, network: String, rx: Receiver<Trigger>) {
     info!("worker: started (tick {}s)", TICK_SECS);
     let mut last_zmq_msg = timeutil::now();
-    let mut last_heartbeat: i64 = 0;
+    let mut last_duties: i64 = 0;
     let mut last_backstop: i64 = 0;
     let mut last_degraded_recheck: i64 = 0;
+    // Heartbeat schedule survives restarts (meta), so a crash-looping daemon
+    // can't spam digests — and a MISSED heartbeat stays a meaningful signal.
+    let mut last_heartbeat: i64 = {
+        let c = conn.lock().expect("db mutex");
+        db::meta_get(&c, "last_heartbeat_at")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    };
+
+    // One echo pass shortly after a ZMQ-triggered cycle: zmqpubrawtx can
+    // publish before the node's wallets finish indexing the tx, so the
+    // triggered pass may query a hair too early. The echo closes that race
+    // without reverting to a constant poll storm.
+    let mut followup_at: Option<i64> = None;
 
     loop {
-        // Wait for a trigger or the tick. Drain any pile-up so a burst of ZMQ
-        // messages coalesces into one pass instead of N redundant ones.
-        let trigger = rx.recv_timeout(Duration::from_secs(TICK_SECS));
-        let mut zmq_activity = false;
+        // Wait for a trigger or the tick (shortened when an echo is due).
+        // Drain any pile-up so a burst of ZMQ messages coalesces into one
+        // pass instead of N redundant ones.
+        let wait_secs = match followup_at {
+            Some(t) => (t - timeutil::now()).clamp(1, TICK_SECS as i64) as u64,
+            None => TICK_SECS,
+        };
+        let trigger = rx.recv_timeout(Duration::from_secs(wait_secs));
+        let mut real_work = false; // something happened on-chain / via API
         match &trigger {
-            Ok(Trigger::Zmq) | Ok(Trigger::ZmqGap) => zmq_activity = true,
-            Ok(Trigger::ZmqIdle) | Ok(Trigger::Nudge) => {}
-            Err(RecvTimeoutError::Timeout) => {}
+            Ok(Trigger::Zmq) | Ok(Trigger::ZmqGap) | Ok(Trigger::Nudge) => real_work = true,
+            Ok(Trigger::ZmqIdle) => {}
+            Err(RecvTimeoutError::Timeout) => real_work = true,
             Err(RecvTimeoutError::Disconnected) => {
                 info!("worker: trigger channel closed — exiting");
                 return;
             }
         }
+        let mut zmq_activity = matches!(&trigger, Ok(Trigger::Zmq) | Ok(Trigger::ZmqGap));
         while let Ok(t) = rx.try_recv() {
             if matches!(t, Trigger::Zmq | Trigger::ZmqGap) {
                 zmq_activity = true;
+                real_work = true;
+            }
+            if matches!(t, Trigger::Nudge) {
+                real_work = true;
             }
         }
         let now = timeutil::now();
         if zmq_activity {
             last_zmq_msg = now;
         }
+        let followup_due = followup_at.map_or(false, |t| now >= t);
+        // The ZMQ thread's 5s recv timeout sends ZmqIdle just to keep this
+        // loop's liveness accounting current. Idle pokes alone must not run
+        // the duty cycle, or the "30s tick floor" becomes a 5s RPC-poll storm.
+        if !real_work && !followup_due && now - last_duties < TICK_SECS as i64 {
+            continue;
+        }
+        if followup_due {
+            followup_at = None;
+        }
+        if zmq_activity {
+            followup_at = Some(now + 2);
+        }
+        last_duties = now;
 
         let conn = match conn.lock() {
             Ok(c) => c,
@@ -85,6 +123,7 @@ pub fn run(conn: Arc<Mutex<Connection>>, rpc: RpcClient, network: String, rx: Re
             }
             detect::update_confirmations(&conn, &rpc);
             arming::poll_onboarding(&conn, &rpc);
+            reconcile::finish_pending_rescans(&conn, &rpc);
             process_due_checkpoints(&conn, &rpc);
 
             // --- backstop reconciliation, cheap cadence (~5min).
@@ -127,6 +166,7 @@ pub fn run(conn: Arc<Mutex<Connection>>, rpc: RpcClient, network: String, rx: Re
         if now - last_heartbeat >= hb_interval {
             heartbeat(&conn);
             last_heartbeat = now;
+            let _ = db::meta_set(&conn, "last_heartbeat_at", &now.to_string());
         }
     }
 }
@@ -239,6 +279,15 @@ fn escalation_sweep(conn: &Connection) {
     };
     for (eid, wid, label, sat, spent_txid, conf) in due {
         let token = crate::auth::mint_cap_token(conn, eid);
+        if token.is_none() {
+            // Repeats keep ringing, but the ack path is broken — say so.
+            degraded::raise(
+                conn,
+                "cap_token_key_missing",
+                "The capability-token key is missing from the DB; alarms fire but cannot \
+                 be acknowledged. Run `satsurvd rotate-secrets` (daemon stopped) to repair.",
+            );
+        }
         let p = outbox::payload(
             outbox::TIER_ALARM,
             "spend_alarm_repeat",

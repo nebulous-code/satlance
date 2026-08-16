@@ -73,14 +73,25 @@ pub fn begin_import(
         }
     }
 
+    // The watch model needs ranged descriptors (gap limit, future addresses).
+    // A non-ranged one would also make Core reject the "range" param below —
+    // refuse it with a name rather than a confusing node error.
+    if let Some(_bad) = descriptors.iter().find(|d| !d.contains('*')) {
+        return Err("descriptor_not_ranged".into());
+    }
+
     // Expand a single receive-branch descriptor to receive+change (§5.3 —
     // under-importing the change branch is the classic silent failure).
+    // Strip any "#checksum" suffix FIRST: the checksum is over the exact
+    // string, so a mutated branch with the old checksum is rejected by the
+    // node; getdescriptorinfo below re-canonicalizes both branches.
     let mut expanded: Vec<String> = Vec::new();
     for d in descriptors {
-        expanded.push(d.clone());
-        if d.contains("/0/*") && !descriptors.iter().any(|x| x.contains("/1/*")) {
-            expanded.push(d.replace("/0/*", "/1/*"));
+        let bare = d.split('#').next().unwrap_or(d).to_string();
+        if bare.contains("/0/*") && !descriptors.iter().any(|x| x.contains("/1/*")) {
+            expanded.push(bare.replace("/0/*", "/1/*"));
         }
+        expanded.push(bare);
     }
 
     let range = db::config_get_i64(conn, "gap_limit_start");
@@ -91,14 +102,14 @@ pub fn begin_import(
             .call(None, "getdescriptorinfo", json!([d]))
             .map_err(|_| "descriptor rejected by node (checksum/parse)".to_string())?;
         let canonical = info["descriptor"].as_str().unwrap_or(d).to_string();
+        // No "label": Core (28.x) rejects labels on ranged descriptors.
         requests.push(json!({
             "desc": canonical,
             "timestamp": 0,          // full history rescan — cold storage may be old
             "range": [0, range],
             "active": false,
             "internal": d.contains("/1/*"),
-            "watchonly": true,
-            "label": ""
+            "watchonly": true
         }));
     }
 
@@ -116,6 +127,15 @@ pub fn begin_import(
                 notify_error(conn, wallet_id, &label, "descriptor import reported failure");
                 return Err("import_failed".into());
             }
+            Ok(())
+        }
+        Err(RpcError::Transport(_)) => {
+            // The call carries a short timeout on purpose: a mainnet
+            // full-history rescan runs for hours INSIDE importdescriptors.
+            // Timing out after the request was sent means "the node took the
+            // job" — stay `importing`; poll_onboarding watches
+            // getwalletinfo.scanning and finishes the flow either way.
+            info!("wallet '{label}': import call timed out — treating as rescan-in-progress (poller will confirm)");
             Ok(())
         }
         Err(e) => {
@@ -180,14 +200,38 @@ pub fn poll_onboarding(conn: &Connection, rpc: &RpcClient) {
             Err(_) => continue,
         };
         let scanning = info["scanning"].is_object(); // false when idle, object while scanning
+        if scanning {
+            // mid-rescan: adopt registered -> importing, otherwise just wait
+            if state == "registered" {
+                let _ = set_state(conn, id, "importing");
+                info!("wallet '{label}': detected scanning in Core (by-hand path) — importing");
+            }
+            continue; // still BLIND — stays importing (NOT PROTECTED)
+        }
+
+        // A loaded wallet is NOT evidence of an imported watch set: a failed
+        // automated import leaves a blank wallet behind, and a blank wallet
+        // scans instantly to a balance of 0 — which would then arm a watch
+        // over NOTHING (the looks-protected-but-isn't trap, §5). Require
+        // actual descriptors before declaring anything about this wallet.
+        let desc_count = match rpc.list_descriptors(&core_ref) {
+            Ok(v) => v["descriptors"].as_array().map(|a| a.len()).unwrap_or(0),
+            Err(_) => continue,
+        };
+        if desc_count == 0 {
+            if state == "importing" {
+                // import evidently never reached the node (e.g. transport
+                // dropped before delivery): be honest, don't wait silently
+                let _ = set_state(conn, id, "error");
+                notify_error(conn, id, &label, "import finished with no descriptors in the watch wallet");
+            }
+            continue; // registered + blank: keep waiting for a real import
+        }
 
         if state == "registered" {
-            // by-hand import detected: wallet exists in Core now
+            // by-hand import detected: wallet exists in Core WITH descriptors
             let _ = set_state(conn, id, "importing");
             info!("wallet '{label}': detected in Core (by-hand path) — importing/rescan");
-        }
-        if scanning {
-            continue; // still BLIND — stays importing (NOT PROTECTED)
         }
         // rescan complete -> awaiting + first balance prompt (§5.4)
         match reconcile::compute_balance(rpc, &core_ref) {

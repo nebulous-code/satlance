@@ -90,47 +90,70 @@ fn register(c: &Cfg) {
     }
 }
 
-/// Map tier → ntfy priority. The alarm tier is maximally loud.
-fn priority(tier: &str) -> &'static str {
+/// Map tier → ntfy numeric priority. The alarm tier is maximally loud.
+fn priority(tier: &str) -> u8 {
     match tier {
-        "alarm" => "urgent",
-        "degraded" => "high",
-        _ => "default",
+        "alarm" => 5,    // urgent
+        "degraded" => 4, // high
+        _ => 3,          // default
     }
 }
 
+/// Split the topic URL into (server base, topic). NTFY_URL stays a full
+/// topic URL for the operator; JSON publishing needs them separately.
+fn split_topic_url(url: &str) -> Result<(String, String), String> {
+    let trimmed = url.trim_end_matches('/');
+    match trimmed.rsplit_once('/') {
+        Some((base, topic)) if !topic.is_empty() && base.contains("://") => {
+            Ok((base.to_string(), topic.to_string()))
+        }
+        _ => Err(format!("NTFY_URL must be a full topic URL (got '{url}')")),
+    }
+}
+
+/// Deliver one payload by POSTing ntfy's JSON publish format to the server
+/// base. Title/body ride in the JSON body, so UTF-8 is fine — header-based
+/// publishing rejects non-ASCII titles, and the alarm title contains both an
+/// emoji and an em-dash (the one message that must never fail to deliver).
 fn deliver(c: &Cfg, payload: &Value) -> Result<(), String> {
     let tier = payload["tier"].as_str().unwrap_or("heartbeat");
     let title = payload["title"].as_str().unwrap_or("Sat Surveillance");
     let body = payload["body"].as_str().unwrap_or("");
-    let mut req = ureq::post(&c.ntfy_url)
-        .set("Title", title)
-        .set("Priority", priority(tier))
-        .set(
-            "Tags",
-            match tier {
-                "alarm" => "rotating_light",
-                "degraded" => "warning",
-                _ => "heartbeat",
-            },
-        );
-    if let Some(tok) = &c.ntfy_token {
-        req = req.set("Authorization", &format!("Bearer {tok}"));
-    }
+    let (base, topic) = split_topic_url(&c.ntfy_url)?;
+
+    let mut msg = json!({
+        "topic": topic,
+        "title": title,
+        "message": body,
+        "priority": priority(tier),
+        "tags": [match tier {
+            "alarm" => "rotating_light",
+            "degraded" => "warning",
+            _ => "heartbeat",
+        }],
+    });
     // Phone-button ack: only when the core is reachable FROM THE PHONE
     // (PUBLIC_API_URL, ideally TLS via tailscale serve — design M7).
-    if let (Some(base), Some(ack_path), Some(token)) = (
+    if let (Some(api_base), Some(ack_path), Some(token)) = (
         &c.public_api,
         payload["ack_path"].as_str(),
         payload["capability_token"].as_str(),
     ) {
-        let action = format!(
-            "http, Acknowledge, {base}{ack_path}, method=POST, headers.Content-Type=application/json, body={}",
-            json!({"capability_token": token})
-        );
-        req = req.set("Actions", &action);
+        msg["actions"] = json!([{
+            "action": "http",
+            "label": "Acknowledge",
+            "url": format!("{api_base}{ack_path}"),
+            "method": "POST",
+            "headers": {"Content-Type": "application/json"},
+            "body": json!({"capability_token": token}).to_string(),
+        }]);
     }
-    req.send_string(body).map_err(|e| e.to_string())?;
+
+    let mut req = ureq::post(&base);
+    if let Some(tok) = &c.ntfy_token {
+        req = req.set("Authorization", &format!("Bearer {tok}"));
+    }
+    req.send_json(msg).map_err(|e| e.to_string())?;
     Ok(())
 }
 

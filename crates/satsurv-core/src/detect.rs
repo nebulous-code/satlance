@@ -25,12 +25,11 @@ pub struct WalletRow {
     pub id: i64,
     pub label: String,
     pub core_ref: String,
-    pub arming_state: String,
 }
 
 pub fn watched_wallets(conn: &Connection) -> rusqlite::Result<Vec<WalletRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id,label,core_wallet_ref,arming_state FROM wallet
+        "SELECT id,label,core_wallet_ref FROM wallet
          WHERE arming_state IN ('armed','blinded')",
     )?;
     let v = stmt
@@ -39,7 +38,6 @@ pub fn watched_wallets(conn: &Connection) -> rusqlite::Result<Vec<WalletRow>> {
                 id: r.get(0)?,
                 label: r.get(1)?,
                 core_ref: r.get(2)?,
-                arming_state: r.get(3)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -53,6 +51,10 @@ pub fn watched_wallets(conn: &Connection) -> rusqlite::Result<Vec<WalletRow>> {
 /// makes that idempotent — §8.4).
 pub fn detection_pass(conn: &Connection, rpc: &RpcClient) -> Result<(), String> {
     let last_hash = db::meta_get(conn, "last_block_hash");
+    // Capture the tip BEFORE scanning: a block mined mid-pass must stay
+    // above the persisted floor so the next pass still covers it. (Persisting
+    // a post-scan tip would skip anything mined between scan and persist.)
+    let pre_scan_tip = rpc.get_best_block_hash().ok();
     let wallets = watched_wallets(conn).map_err(|e| e.to_string())?;
     let mut all_ok = true;
 
@@ -66,7 +68,7 @@ pub fn detection_pass(conn: &Connection, rpc: &RpcClient) -> Result<(), String> 
     update_confirmations(conn, rpc);
 
     if all_ok {
-        if let Ok(tip) = rpc.get_best_block_hash() {
+        if let Some(tip) = pre_scan_tip {
             db::meta_set(conn, "last_block_hash", &tip).map_err(|e| e.to_string())?;
         }
     }
@@ -113,18 +115,12 @@ fn process_candidate_spend(
     w: &WalletRow,
     spending_txid: &str,
 ) -> Result<(), String> {
-    // already evented? (ZMQ-then-RPC double hit, or rescan overlap)
-    let known: Option<i64> = conn
-        .query_row(
-            "SELECT COUNT(*) FROM event WHERE spending_txid=?1",
-            [spending_txid],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    if known.unwrap_or(0) > 0 {
-        return Ok(()); // confirmation tracking handles updates
-    }
+    // No "already evented?" shortcut here on purpose: one transaction can
+    // consume outpoints from SEVERAL watched wallets (or several of one
+    // wallet's, half-recorded before a crash), and a tx-level early exit
+    // silently drops the rest. `record_spend` dedups per outpoint via
+    // idx_event_dedup, which is the correct granularity; the cost is a few
+    // redundant lookups until the scan floor advances past the tx.
 
     let d = rpc
         .get_transaction(&w.core_ref, spending_txid, true)
@@ -274,8 +270,27 @@ pub fn record_spend(
             }
         } else {
             // ALARM. Mint the single-use capability token (sign on the way
-            // out, §10.2); only its hash is stored.
-            let token = auth::mint_cap_token(conn, event_id).unwrap_or_default();
+            // out, §10.2); only its hash is stored. A mint failure (missing
+            // token key) means the ack path is broken — that must be LOUD,
+            // not a silent empty token, but it never blocks the alarm itself
+            // (fail toward can't-dismiss, invariant 11).
+            let token = match auth::mint_cap_token(conn, event_id) {
+                Some(t) => t,
+                None => {
+                    log::error!(
+                        "capability token mint FAILED for event {event_id} — \
+                         acknowledge will not work until secrets are repaired \
+                         (satsurvd rotate-secrets)"
+                    );
+                    crate::degraded::raise(
+                        conn,
+                        "cap_token_key_missing",
+                        "The capability-token key is missing from the DB; alarms fire but cannot \
+                         be acknowledged. Run `satsurvd rotate-secrets` (daemon stopped) to repair.",
+                    );
+                    String::new()
+                }
+            };
             conn.execute(
                 "UPDATE event SET cap_token_hash=?1 WHERE id=?2",
                 params![auth::sha256_hex(&token), event_id],
@@ -338,9 +353,78 @@ fn conf_state_human(s: &str) -> &'static str {
     }
 }
 
-/// Confirmation-axis tracking (§8.6): poll open events against Core and walk
-/// seen -> confirmed -> final, with reorged / vanished off-ramps. Emits
-/// status updates only at configured `notify_depths`.
+/// What the node currently says about a spending tx, as plain data so the
+/// transition decision below is a pure, unit-testable function.
+pub struct TxView {
+    /// The wallet still knows the tx (`gettransaction` succeeded).
+    pub known: bool,
+    /// Confirmations per the wallet; meaningless when `known` is false.
+    pub confirmations: i64,
+    /// Node-level mempool presence; None = probe unavailable/failed.
+    pub in_mempool: Option<bool>,
+    /// Seconds since the event was detected.
+    pub age_secs: i64,
+}
+
+pub enum ConfAction {
+    None,
+    /// Tx is gone for real (conflicted, expunged, or aged out of the
+    /// mempool): close the event (EDGE 6).
+    Vanish,
+    /// EDGE 5: confirmed then un-confirmed by a reorg.
+    Reorged,
+    /// Normal progress to N >= 1 confirmations.
+    Advance(i64),
+    /// A vanished spend came back (re-broadcast or finally mined). The
+    /// alarm must re-open — a closed event must never mask a live theft.
+    Resurrect(i64),
+}
+
+/// The confirmation-axis transition decision (§8.6), pure. Key property:
+/// **age alone never vanishes a still-live tx.** A spend kept alive in the
+/// mempool past the timeout (trivial for an attacker: re-broadcast) must
+/// keep ringing, and one that vanished then reappears must ring again.
+pub fn decide_confirmation(old_state: &str, tx: &TxView, vanished_after: i64) -> ConfAction {
+    if !tx.known {
+        // Wallet no longer knows it (dropped/abandoned). Give it the full
+        // window before declaring it gone — transient wallet states happen.
+        return if old_state != "vanished" && tx.age_secs > vanished_after {
+            ConfAction::Vanish
+        } else {
+            ConfAction::None
+        };
+    }
+    if tx.confirmations < 0 {
+        // Conflicted: a different tx spent the inputs — this one can never
+        // confirm. Definitive regardless of age.
+        return if old_state == "vanished" { ConfAction::None } else { ConfAction::Vanish };
+    }
+    if tx.confirmations == 0 {
+        return match old_state {
+            "confirmed" => ConfAction::Reorged,
+            // back in the mempool at 0-conf after we closed it: live again
+            "vanished" if tx.in_mempool == Some(true) => ConfAction::Resurrect(0),
+            "vanished" => ConfAction::None,
+            // seen/reorged at 0-conf: vanish only when aged out AND the
+            // node's mempool confirms absence (probe failure ⇒ keep waiting)
+            _ if tx.age_secs > vanished_after && tx.in_mempool == Some(false) => {
+                ConfAction::Vanish
+            }
+            _ => ConfAction::None,
+        };
+    }
+    // confirmations >= 1
+    if old_state == "vanished" {
+        ConfAction::Resurrect(tx.confirmations)
+    } else {
+        ConfAction::Advance(tx.confirmations)
+    }
+}
+
+/// Confirmation-axis tracking (§8.6): poll non-final events (including
+/// `vanished` ones, so resurrections are caught) against Core and apply
+/// `decide_confirmation`. Emits status updates only at configured
+/// `notify_depths`.
 pub fn update_confirmations(conn: &Connection, rpc: &RpcClient) {
     let depths: Vec<i64> = db::config_get(conn, "notify_depths")
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -354,7 +438,7 @@ pub fn update_confirmations(conn: &Connection, rpc: &RpcClient) {
             "SELECT e.id, e.wallet_id, w.label, w.core_wallet_ref, e.confirmations,
                     e.confirmation, e.detected_at, e.spending_txid
              FROM event e JOIN wallet w ON w.id=e.wallet_id
-             WHERE e.confirmation NOT IN ('final','vanished')",
+             WHERE e.confirmation != 'final'",
         ) {
             Ok(s) => s,
             Err(_) => return,
@@ -374,27 +458,24 @@ pub fn update_confirmations(conn: &Connection, rpc: &RpcClient) {
     };
 
     for (eid, wid, wlabel, wref, old_conf, old_state, detected_at, spending_txid) in rows {
-        let tx = match rpc.get_transaction(&wref, &spending_txid, false) {
-            Ok(t) => t,
-            Err(crate::rpc::RpcError::Node { code: -5, .. }) => {
-                // wallet no longer knows the tx: dropped/abandoned
-                if now - detected_at > vanished_after {
-                    transition_vanished(conn, eid, wid, &wlabel);
-                }
-                continue;
-            }
+        let (known, c) = match rpc.get_transaction(&wref, &spending_txid, false) {
+            Ok(t) => (true, t["confirmations"].as_i64().unwrap_or(0)),
+            Err(crate::rpc::RpcError::Node { code: -5, .. }) => (false, 0),
             Err(_) => continue, // node trouble; degraded handling covers it
         };
-        let c = tx["confirmations"].as_i64().unwrap_or(0);
+        let age = now - detected_at;
+        // Mempool probe only where the decision needs it (0-conf cases).
+        let in_mempool = if known && c == 0 {
+            rpc.in_mempool(&spending_txid).ok()
+        } else {
+            None
+        };
+        let view = TxView { known, confirmations: c, in_mempool, age_secs: age };
 
-        if c < 0 {
-            // conflicted: replaced/double-spent away — never confirmed
-            transition_vanished(conn, eid, wid, &wlabel);
-            continue;
-        }
-        if c == 0 {
-            if old_state == "confirmed" {
-                // EDGE 5: confirmed then un-confirmed = reorged
+        match decide_confirmation(&old_state, &view, vanished_after) {
+            ConfAction::None => {}
+            ConfAction::Vanish => transition_vanished(conn, eid, wid, &wlabel),
+            ConfAction::Reorged => {
                 let _ = conn.execute(
                     "UPDATE event SET confirmation='reorged', confirmations=0 WHERE id=?1",
                     [eid],
@@ -408,33 +489,84 @@ pub fn update_confirmations(conn: &Connection, rpc: &RpcClient) {
                 );
                 let _ = outbox::enqueue(conn, outbox::TIER_DEGRADED, "event_reorged",
                                         Some(wid), Some(eid), &p);
-            } else if old_state == "seen" && now - detected_at > vanished_after {
-                transition_vanished(conn, eid, wid, &wlabel);
             }
-            continue;
-        }
-
-        // c >= 1
-        let new_state = confirmation_state(c, final_d);
-        let _ = conn.execute(
-            "UPDATE event SET confirmation=?1, confirmations=?2 WHERE id=?3",
-            params![new_state, c, eid],
-        );
-        // notify on crossing configured depths (0 was emitted at creation)
-        for d in depths.iter().filter(|d| **d > 0 && old_conf < **d && c >= **d) {
-            let kind = "confirmation_update";
-            let p = outbox::payload(
-                outbox::TIER_HEARTBEAT, kind,
-                &format!("Spend event #{eid}: {d} confirmation(s)"),
-                &format!(
-                    "The spend from {wlabel} now has {c} confirmation(s){}.",
-                    if new_state == "final" { " — FINAL" } else { "" }
-                ),
-                Some(&wlabel), Some(eid), None, None,
-            );
-            let _ = outbox::enqueue(conn, outbox::TIER_HEARTBEAT, kind, Some(wid), Some(eid), &p);
+            ConfAction::Resurrect(c) => transition_resurrected(conn, eid, wid, &wlabel, c, final_d),
+            ConfAction::Advance(c) => {
+                let new_state = confirmation_state(c, final_d);
+                let _ = conn.execute(
+                    "UPDATE event SET confirmation=?1, confirmations=?2 WHERE id=?3",
+                    params![new_state, c, eid],
+                );
+                // notify on crossing configured depths (0 was emitted at creation)
+                for d in depths.iter().filter(|d| **d > 0 && old_conf < **d && c >= **d) {
+                    let kind = "confirmation_update";
+                    let p = outbox::payload(
+                        outbox::TIER_HEARTBEAT, kind,
+                        &format!("Spend event #{eid}: {d} confirmation(s)"),
+                        &format!(
+                            "The spend from {wlabel} now has {c} confirmation(s){}.",
+                            if new_state == "final" { " — FINAL" } else { "" }
+                        ),
+                        Some(&wlabel), Some(eid), None, None,
+                    );
+                    let _ = outbox::enqueue(conn, outbox::TIER_HEARTBEAT, kind, Some(wid), Some(eid), &p);
+                }
+            }
         }
     }
+}
+
+/// A vanished spend reappeared (re-broadcast / mined after we closed the
+/// event). Re-open the alarm if the close was OUR doing (`auto_resolved`);
+/// an event a human acknowledged stays acknowledged. Single transaction
+/// (invariant 18).
+fn transition_resurrected(
+    conn: &Connection,
+    event_id: i64,
+    wallet_id: i64,
+    wlabel: &str,
+    confirmations: i64,
+    final_d: i64,
+) {
+    let new_state = if confirmations >= 1 {
+        confirmation_state(confirmations, final_d)
+    } else {
+        "seen"
+    };
+    let _ = conn.execute_batch("BEGIN IMMEDIATE");
+    let _ = conn.execute(
+        "UPDATE event SET confirmation=?1, confirmations=?2 WHERE id=?3",
+        params![new_state, confirmations.max(0), event_id],
+    );
+    let reopened = conn
+        .execute(
+            "UPDATE event SET resolution='firing', resolved_at=NULL, last_escalated_at=?1
+             WHERE id=?2 AND resolution='auto_resolved'",
+            params![timeutil::now(), event_id],
+        )
+        .unwrap_or(0);
+    if reopened > 0 {
+        warn!("ALARM REOPENED: vanished spend on '{wlabel}' is back (event {event_id}, {confirmations} conf)");
+        let token = auth::mint_cap_token(conn, event_id);
+        let p = outbox::payload(
+            outbox::TIER_ALARM,
+            "spend_alarm_reopened",
+            &format!("⚠ SPEND RE-APPEARED — {wlabel}"),
+            &format!(
+                "A spend that previously vanished from the mempool is back \
+                 ({}). The alarm has re-opened and will escalate until \
+                 acknowledged.",
+                if confirmations >= 1 { "now confirmed on-chain" } else { "back in the mempool" }
+            ),
+            Some(wlabel),
+            Some(event_id),
+            None,
+            token.as_deref(),
+        );
+        let _ = outbox::enqueue(conn, outbox::TIER_ALARM, "spend_alarm_reopened",
+                                Some(wallet_id), Some(event_id), &p);
+    }
+    let _ = conn.execute_batch("COMMIT");
 }
 
 /// EDGE 6: a firing event whose confirmation axis hits `vanished` is
@@ -467,7 +599,6 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use crate::db;
-    use serde_json::json;
 
     fn mem() -> Connection {
         let c = Connection::open_in_memory().unwrap();
@@ -604,6 +735,101 @@ mod tests {
             .query_row("SELECT resolution FROM event WHERE id=?1", [eid], |r| r.get(0))
             .unwrap();
         assert_eq!(res, "firing", "outpoint (txid,vout) identity is the matcher");
+    }
+
+    #[test]
+    fn multi_outpoint_spend_records_every_outpoint() {
+        // One tx consuming several watched outpoints (cross-wallet or
+        // intra-wallet) must produce one event PER outpoint — dedup is by
+        // (spent_txid, spent_vout, spending_txid), never by tx alone.
+        let c = mem();
+        let e1 = record_spend(&c, 1, "cold", &op("aa", 0, 1000), "bb", 0).unwrap();
+        let e2 = record_spend(&c, 1, "cold", &op("cc", 2, 2000), "bb", 0).unwrap();
+        assert!(e1.is_some() && e2.is_some(), "second outpoint of the same tx must not be dropped");
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM event WHERE spending_txid='bb'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn vanish_decision_never_closes_a_live_tx() {
+        let after = 100;
+        let v = |old: &str, tx: &TxView| decide_confirmation(old, tx, after);
+        let mk = |known, c, mem: Option<bool>, age| TxView {
+            known, confirmations: c, in_mempool: mem, age_secs: age,
+        };
+        // aged but STILL IN MEMPOOL: must not vanish (attacker re-broadcasts)
+        assert!(matches!(v("seen", &mk(true, 0, Some(true), 999)), ConfAction::None));
+        // aged and mempool probe failed: don't guess, keep waiting
+        assert!(matches!(v("seen", &mk(true, 0, None, 999)), ConfAction::None));
+        // aged and confirmed-absent: vanish
+        assert!(matches!(v("seen", &mk(true, 0, Some(false), 999)), ConfAction::Vanish));
+        // conflicted: vanish immediately regardless of age
+        assert!(matches!(v("seen", &mk(true, -1, None, 1)), ConfAction::Vanish));
+        // wallet forgot it, aged: vanish; recent: wait
+        assert!(matches!(v("seen", &mk(false, 0, None, 999)), ConfAction::Vanish));
+        assert!(matches!(v("seen", &mk(false, 0, None, 1)), ConfAction::None));
+        // confirmed -> 0-conf = reorg (EDGE 5)
+        assert!(matches!(v("confirmed", &mk(true, 0, None, 1)), ConfAction::Reorged));
+        // vanished then mined: resurrect; vanished back in mempool: resurrect
+        assert!(matches!(v("vanished", &mk(true, 3, None, 999)), ConfAction::Resurrect(3)));
+        assert!(matches!(v("vanished", &mk(true, 0, Some(true), 999)), ConfAction::Resurrect(0)));
+        // vanished and still gone: stay closed
+        assert!(matches!(v("vanished", &mk(true, 0, Some(false), 999)), ConfAction::None));
+        assert!(matches!(v("vanished", &mk(false, 0, None, 999)), ConfAction::None));
+        // normal progress
+        assert!(matches!(v("seen", &mk(true, 2, None, 1)), ConfAction::Advance(2)));
+    }
+
+    #[test]
+    fn resurrected_spend_reopens_auto_resolved_but_not_acknowledged() {
+        let c = mem();
+        // auto_resolved (vanish-closed) event comes back -> firing + alarm
+        c.execute(
+            "INSERT INTO event(wallet_id,spent_txid,spent_vout,amount_sat,spending_txid,
+             confirmation,resolution,detected_at,resolved_at)
+             VALUES(1,'aa',0,1000,'bb','vanished','auto_resolved',0,50)",
+            [],
+        )
+        .unwrap();
+        transition_resurrected(&c, 1, 1, "cold", 2, 6);
+        let (conf, res): (String, String) = c
+            .query_row("SELECT confirmation,resolution FROM event WHERE id=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(conf, "confirmed");
+        assert_eq!(res, "firing", "a closed event must never mask a live theft");
+        let alarms: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM outbox WHERE kind='spend_alarm_reopened'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alarms, 1);
+
+        // acknowledged event comes back -> confirmation updates, but the
+        // human's acknowledgement stands (no re-fire)
+        c.execute(
+            "INSERT INTO event(wallet_id,spent_txid,spent_vout,amount_sat,spending_txid,
+             confirmation,resolution,detected_at,resolved_at)
+             VALUES(1,'cc',0,1000,'dd','vanished','acknowledged',0,50)",
+            [],
+        )
+        .unwrap();
+        transition_resurrected(&c, 2, 1, "cold", 1, 6);
+        let res2: String = c
+            .query_row("SELECT resolution FROM event WHERE id=2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(res2, "acknowledged");
+        let alarms2: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM outbox WHERE kind='spend_alarm_reopened'",
+                [], |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alarms2, 1, "acknowledged events must not re-fire");
     }
 
     #[test]

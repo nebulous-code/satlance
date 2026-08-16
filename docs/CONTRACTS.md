@@ -58,9 +58,12 @@ Notes:
 - `balance/confirm` requires echoing the `observed_at` you actually saw;
   a mismatch is `409 stale_observation`. This is the never-auto-arm gate.
 - `POST /preauths` for an outpoint that already has a pending preauth is
-  `409 preauth_pending_exists`.
+  `409 preauth_pending_exists`. (`ttl` is accepted as a legacy alias for
+  `ttl_secs`.)
 - `acknowledge` consumes the single-use capability token. Reuse →
   `403 capability_token_invalid`.
+- `DELETE /wallets/{id}` on a wallet with any events/preauths/notifications
+  is `409 wallet_has_history` — the audit trail is kept; disarm instead.
 
 ## Notifier surface
 

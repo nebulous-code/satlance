@@ -17,7 +17,10 @@ API=http://127.0.0.1:8330
 NTFY=http://127.0.0.1:8338/satsurv
 
 step() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
-bcli() { $COMPOSE exec -T bitcoind bitcoin-cli -regtest "$@"; }
+# -datadir: the bitcoin/bitcoin image runs the daemon as user 'bitcoin' with
+# its data in /home/bitcoin/.bitcoin; exec lands as root, which would
+# otherwise look for the cookie in /root/.bitcoin and fail.
+bcli() { $COMPOSE exec -T bitcoind bitcoin-cli -regtest -datadir=/home/bitcoin/.bitcoin "$@"; }
 capi() { # capi <method> <path> [json-body]
   local m=$1 p=$2 body=${3:-}
   if [ -n "$body" ]; then
@@ -57,6 +60,11 @@ for i in $(seq 1 60); do
 done
 capi GET /wallets/$WID | jq '{arming_state, observed_sat, observed_at}'
 [ "$STATE" = awaiting ] || { echo "FAIL: never reached awaiting (state=$STATE)"; exit 1; }
+# The observed balance must be the funded 0.5 BTC. A zero here means the
+# descriptor import silently failed and we'd be arming an EMPTY watch set —
+# the looks-protected-but-isn't trap this tool exists to prevent.
+OBS_SAT=$(capi GET /wallets/$WID | jq -r .observed_sat)
+[ "$OBS_SAT" = 50000000 ] || { echo "FAIL: observed_sat=$OBS_SAT, expected 50000000 — import did not watch the funds"; exit 1; }
 
 step "human-in-the-loop: confirm the observed balance -> ARMED (never auto-arms)"
 OBS=$(capi GET /wallets/$WID | jq -r .observed_at)
@@ -66,13 +74,28 @@ capi GET /status | jq '{armed, not_protected}'
 step "spend a watched UTXO -> ALARM"
 SPEND_ADDR=$(bcli -rpcwallet=spender getnewaddress)
 bcli -rpcwallet=coldsrc sendtoaddress "$SPEND_ADDR" 0.2 >/dev/null
-sleep 5   # zmq rawtx -> detection pass
-EV=$(capi GET '/events?resolution=firing' | jq '.[0]')
+EV=null
+for i in $(seq 1 20); do   # zmq rawtx -> detection pass (30s tick is the backstop)
+  EV=$(capi GET '/events?resolution=firing' | jq '.[0]')
+  [ "$(echo "$EV" | jq -r .resolution)" = firing ] && break
+  sleep 2
+done
 echo "$EV" | jq '{id, resolution, amount_sat, txid: .spending_txid}'
 [ "$(echo "$EV" | jq -r .resolution)" = firing ] || { echo "FAIL: no firing event"; exit 1; }
 
 step "the alarm reached ntfy (channel delivery, fan-out)"
-curl -sf "$NTFY/json?poll=1" | jq -r '.title? // empty' | head -3
+# The ALARM specifically must arrive — heartbeats delivering while the alarm
+# fails (e.g. non-ASCII title rejected at the transport) is the worst kind of
+# green: give the notifier a few seconds to pull and deliver, then require it.
+ALARM_SEEN=""
+for i in $(seq 1 15); do
+  if curl -sf "$NTFY/json?poll=1&since=all" | jq -r '.title? // empty' | grep -q "UNAUTHORIZED SPEND"; then
+    ALARM_SEEN=1; break
+  fi
+  sleep 2
+done
+curl -sf "$NTFY/json?poll=1&since=all" | jq -r '.title? // empty' | tail -5
+[ -n "$ALARM_SEEN" ] || { echo "FAIL: the spend alarm never reached ntfy"; exit 1; }
 
 step "acknowledge with the single-use capability token -> silenced"
 EID=$(echo "$EV" | jq -r .id)
@@ -82,11 +105,21 @@ TOKEN=$(capi GET '/outbox?tier=alarm' | jq -r ".[] | select(.payload.event_id==$
 capi POST "/events/$EID/acknowledge" "{\"capability_token\":\"$TOKEN\"}" | jq '{id, resolution}'
 
 step "pre-authorize the NEXT spend -> no alarm"
+bcli generatetoaddress 1 "$MINE" >/dev/null   # confirm the change so listunspent sees it
 UTXO=$(bcli -rpcwallet=coldsrc listunspent | jq '.[0]')
 TXID=$(echo "$UTXO" | jq -r .txid); VOUT=$(echo "$UTXO" | jq -r .vout)
-capi POST /preauths "{\"wallet_id\":$WID,\"txid\":\"$TXID\",\"vout\":$VOUT,\"note\":\"planned move\"}" | jq '{id, status}'
+[ "$TXID" != null ] || { echo "FAIL: no spendable UTXO to pre-authorize"; exit 1; }
+capi POST /preauths "{\"wallet_id\":$WID,\"txid\":\"$TXID\",\"vout\":$VOUT,\"note\":\"planned move\"}" | jq '{id, state}'
 bcli -rpcwallet=coldsrc sendtoaddress "$SPEND_ADDR" 0.1 >/dev/null
-sleep 5
+RESOLVED=""
+for i in $(seq 1 15); do
+  N=$(capi GET '/events?resolution=auto_resolved' | jq 'length')
+  [ "$N" -gt 0 ] && { RESOLVED=1; break; }
+  sleep 2
+done
 capi GET '/events?resolution=auto_resolved' | jq '.[0] | {id, resolution, authorized}'
+[ -n "$RESOLVED" ] || { echo "FAIL: pre-authorized spend did not auto-resolve"; exit 1; }
+FIRING=$(capi GET '/events?resolution=firing' | jq 'length')
+[ "$FIRING" = 0 ] || { echo "FAIL: pre-authorized spend still raised an alarm"; exit 1; }
 
 step "done — tear down with: $COMPOSE down -v"

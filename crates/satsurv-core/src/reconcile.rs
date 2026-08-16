@@ -148,11 +148,11 @@ pub fn confirm(conn: &Connection, wallet_id: i64, observed_at_unix: i64) -> Resu
 /// Synchronous on regtest-scale wallets; `observed_status='scanning'` covers
 /// a heartbeat overlapping a slow mainnet rescan.
 pub fn dispute(conn: &Connection, rpc: &RpcClient, wallet_id: i64) -> Result<(), String> {
-    let (label, core_ref, prev_sat): (String, String, Option<i64>) = conn
+    let (label, core_ref): (String, String) = conn
         .query_row(
-            "SELECT label, core_wallet_ref, observed_sat FROM wallet WHERE id=?1",
+            "SELECT label, core_wallet_ref FROM wallet WHERE id=?1",
             [wallet_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(|_| "wallet_not_found".to_string())?;
 
@@ -163,10 +163,30 @@ pub fn dispute(conn: &Connection, rpc: &RpcClient, wallet_id: i64) -> Result<(),
     .map_err(|e| e.to_string())?;
     info!("wallet '{label}': balance disputed — bumping gap limit + rescanning");
 
-    let result = bump_and_rescan(rpc, conn, &core_ref);
+    match bump_and_rescan(rpc, conn, &core_ref)? {
+        BumpResult::Done => complete_rescan(conn, rpc, wallet_id),
+        BumpResult::Started => {
+            // The import call timed out: a deep (mainnet) rescan is running
+            // inside the node. Stay 'scanning' — the heartbeat shows
+            // "(rescan in progress)" and the worker's finish_pending_rescans
+            // duty completes the dispute when getwalletinfo.scanning clears.
+            info!("wallet '{label}': rescan running in the node — will recompute when it completes");
+            Ok(())
+        }
+    }
+}
 
-    // Recompute and return to awaiting (idle) regardless of bump outcome —
-    // disputed is never a resting state.
+/// Tail of a dispute: recompute the balance, advance observed_*, return to
+/// idle, prompt. Called synchronously when the rescan finished inline
+/// (regtest-fast), or from the worker duty once a slow node-side rescan ends.
+pub fn complete_rescan(conn: &Connection, rpc: &RpcClient, wallet_id: i64) -> Result<(), String> {
+    let (label, core_ref, prev_sat): (String, String, Option<i64>) = conn
+        .query_row(
+            "SELECT label, core_wallet_ref, observed_sat FROM wallet WHERE id=?1",
+            [wallet_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|_| "wallet_not_found".to_string())?;
     let now = timeutil::now();
     match compute_balance(rpc, &core_ref) {
         Ok(sat) => {
@@ -193,23 +213,59 @@ pub fn dispute(conn: &Connection, rpc: &RpcClient, wallet_id: i64) -> Result<(),
                 "Rescan complete — no further UTXOs found."
             };
             prompt_confirm(conn, wallet_id, &label, sat, now, note);
+            Ok(())
         }
         Err(e) => {
             let _ = conn.execute(
                 "UPDATE wallet SET observed_status='idle' WHERE id=?1",
                 [wallet_id],
             );
-            return Err(format!("rescan balance recompute failed: {e}"));
+            Err(format!("rescan balance recompute failed: {e}"))
         }
     }
-    result
+}
+
+/// Worker duty: finish disputes whose node-side rescan outlived the RPC
+/// timeout. For every wallet stuck in observed_status='scanning', check
+/// whether the node is still scanning; when it's done, run the dispute tail.
+pub fn finish_pending_rescans(conn: &Connection, rpc: &RpcClient) {
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt = match conn.prepare(
+            "SELECT id, label, core_wallet_ref FROM wallet WHERE observed_status='scanning'",
+        ) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map(|m| m.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    };
+    for (id, label, core_ref) in rows {
+        let info = match rpc.get_wallet_info(&core_ref) {
+            Ok(i) => i,
+            Err(_) => continue, // node trouble: watchdog's job
+        };
+        if info["scanning"].is_object() {
+            continue; // still rescanning — heartbeat shows "(rescan in progress)"
+        }
+        if let Err(e) = complete_rescan(conn, rpc, id) {
+            warn!("wallet '{label}': finishing rescan failed: {e}");
+        }
+    }
+}
+
+/// Outcome of a gap-limit bump: the node either finished the re-import +
+/// rescan inline, or took the job and is still scanning (RPC timed out).
+enum BumpResult {
+    Done,
+    Started,
 }
 
 /// Gap-limit bump: read current descriptors, re-import each ranged descriptor
 /// with a doubled range (start 1000 → cap 10000, §13), full-history rescan.
 /// The descriptor strings pass straight from Core back to Core — never
 /// persisted, never logged (invariant 6).
-fn bump_and_rescan(rpc: &RpcClient, conn: &Connection, core_ref: &str) -> Result<(), String> {
+fn bump_and_rescan(rpc: &RpcClient, conn: &Connection, core_ref: &str) -> Result<BumpResult, String> {
     let cap = db::config_get_i64(conn, "gap_limit_cap");
     let descs = rpc
         .list_descriptors(core_ref)
@@ -243,11 +299,22 @@ fn bump_and_rescan(rpc: &RpcClient, conn: &Connection, core_ref: &str) -> Result
     }
     if requests.is_empty() {
         info!("dispute rescan: no ranged descriptors below cap — recomputing only");
-        return Ok(());
+        return Ok(BumpResult::Done);
     }
-    rpc.import_descriptors(core_ref, json!(requests))
-        .map_err(|e| format!("importdescriptors failed: {e}"))?;
-    Ok(())
+    match rpc.import_descriptors(core_ref, json!(requests)) {
+        Ok(_) => Ok(BumpResult::Done),
+        // Short import timeout = the node took the job and is rescanning
+        // (a mainnet full-history rescan runs for hours inside the call).
+        Err(RpcError::Transport(_)) => Ok(BumpResult::Started),
+        Err(e) => Err(format!("importdescriptors failed: {e}")),
+    }
+}
+
+/// The backstop's core test, pure for unit testing: is an observed balance
+/// drop bigger than every spend the real-time detector recorded since the
+/// anchor? If so the detector missed something — that's the alarm case.
+pub fn drop_is_unexplained(reconciled_sat: i64, observed_sat: i64, evented_spend_sat: i64) -> bool {
+    observed_sat < reconciled_sat && (reconciled_sat - observed_sat) > evented_spend_sat
 }
 
 /// Periodic backstop (§8.4 heartbeat reconciliation), simplified per module
@@ -282,16 +349,21 @@ pub fn backstop_check(conn: &Connection, rpc: &RpcClient) {
             continue; // consistent — the common case
         }
         let anchor = reconciled_at.unwrap_or(0);
-        let explained: i64 = conn
+        // "Explained" is arithmetic, not a row count: a drop can never
+        // legitimately exceed the total value of the outpoints the detector
+        // evented since the anchor. (A COUNT would let one small detected
+        // spend mask an arbitrarily large undetected one.)
+        let evented_sat: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM event WHERE wallet_id=?1 AND detected_at>=?2",
+                "SELECT COALESCE(SUM(amount_sat),0) FROM event
+                 WHERE wallet_id=?1 AND detected_at>=?2",
                 params![id, anchor],
                 |r| r.get(0),
             )
             .unwrap_or(0);
         let now = timeutil::now();
 
-        if sat < reconciled_sat && explained == 0 {
+        if drop_is_unexplained(reconciled_sat, sat, evented_sat) {
             // The dangerous case: balance dropped, real-time detector saw
             // nothing. Escalate (§8.4) — this is what the backstop exists for.
             warn!("BACKSTOP: wallet '{label}' balance below baseline with NO detected spend");
@@ -409,6 +481,22 @@ mod tests {
         let c = mem();
         let id = add_wallet(&c, "cold", "armed");
         assert_eq!(confirm(&c, id, 1), Err("nothing_to_confirm"));
+    }
+
+    #[test]
+    fn backstop_explained_is_arithmetic_not_a_row_count() {
+        // baseline 5.0, observed 4.99, evented spends total 0.01 -> explained
+        assert!(!drop_is_unexplained(500_000_000, 499_000_000, 1_000_000));
+        // baseline 5.0, observed 2.0, but only 0.01 of spends evented ->
+        // the detector missed something: ALARM (a COUNT-based check would
+        // have called this "explained" because one event row existed)
+        assert!(drop_is_unexplained(500_000_000, 200_000_000, 1_000_000));
+        // drop with zero evented spends -> alarm
+        assert!(drop_is_unexplained(500_000_000, 499_999_999, 0));
+        // growth is never an unexplained drop
+        assert!(!drop_is_unexplained(500_000_000, 600_000_000, 0));
+        // spent-outpoint totals exceed the net drop (change returned) -> explained
+        assert!(!drop_is_unexplained(500_000_000, 480_000_000, 50_000_000));
     }
 
     #[test]

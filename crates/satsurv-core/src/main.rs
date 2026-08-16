@@ -11,6 +11,10 @@
 //!   SATSURV_DB          path to the SQLite DB    (default ./satsurv.db)
 //!   SATSURV_RPC_URL     node RPC base URL        (init only; persisted)
 //!   SATSURV_RPC_COOKIE  path to the .cookie file (init only; persisted)
+//!   SATSURV_ZMQ_ENDPOINTS  comma-separated ZMQ endpoints to SUBSCRIBE to
+//!                       (init only; persisted). Overrides what the node
+//!                       advertises — needed when the node's zmqpub bind
+//!                       address (e.g. 0.0.0.0) isn't connectable from here.
 //!   SATSURV_BIND        API bind address         (default 127.0.0.1:8330 —
 //!                       never bind 0.0.0.0; use `tailscale serve` for remote)
 
@@ -129,7 +133,7 @@ fn cmd_init() -> i32 {
             return 1;
         }
     };
-    let endpoints: Vec<String> = zmq
+    let advertised: Vec<String> = zmq
         .as_array()
         .map(|a| {
             a.iter()
@@ -137,11 +141,40 @@ fn cmd_init() -> i32 {
                 .collect()
         })
         .unwrap_or_default();
-    if endpoints.is_empty() {
+    if advertised.is_empty() {
         error!("init refused: node reports NO ZMQ notification endpoints. Add zmqpubrawtx=tcp://0.0.0.0:28332 (and hashblock) to the node config and restart it.");
         return 1;
     }
-    info!("ZMQ confirmed publishing: {} endpoint(s)", endpoints.len());
+    // getzmqnotifications returns the node's BIND addresses; "0.0.0.0" is
+    // where the node listens, not where we can connect (from another host or
+    // container it points at ourselves). Prefer an explicit override, else
+    // rewrite the wildcard host to the RPC URL's host.
+    let endpoints: Vec<String> = match std::env::var("SATSURV_ZMQ_ENDPOINTS") {
+        Ok(s) if !s.trim().is_empty() => s
+            .split(',')
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty())
+            .collect(),
+        _ => {
+            let rpc_host = rpc_url
+                .split("://")
+                .nth(1)
+                .unwrap_or(&rpc_url)
+                .split([':', '/'])
+                .next()
+                .unwrap_or("127.0.0.1")
+                .to_string();
+            advertised
+                .iter()
+                .map(|e| e.replace("//0.0.0.0:", &format!("//{rpc_host}:")))
+                .collect()
+        }
+    };
+    info!(
+        "ZMQ confirmed publishing: {} endpoint(s); subscribing to {}",
+        advertised.len(),
+        endpoints.join(", ")
+    );
 
     // All checks passed → persist.
     let conn = match db::open(&db_path) {

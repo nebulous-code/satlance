@@ -70,16 +70,34 @@ impl RpcClient {
     }
 
     pub fn call(&self, wallet: Option<&str>, method: &str, params: Value) -> Result<Value> {
+        self.call_with_timeout(wallet, method, params, None)
+    }
+
+    /// Like `call`, but with a per-request timeout override. Used for RPCs
+    /// that legitimately outlive any sane wait (a full-history rescan inside
+    /// `importdescriptors` runs for hours on mainnet): a short timeout there
+    /// means "the node took the job", not failure — the caller polls
+    /// `getwalletinfo.scanning` for completion instead of holding the line.
+    pub fn call_with_timeout(
+        &self,
+        wallet: Option<&str>,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
         let url = match wallet {
             Some(w) => format!("{}/wallet/{}", self.url, w),
             None => self.url.clone(),
         };
         let body = json!({"jsonrpc": "1.0", "id": "satsurv", "method": method, "params": params});
-        let resp = self
+        let mut req = self
             .agent
             .post(&url)
-            .set("Authorization", &self.auth_header()?)
-            .send_json(body);
+            .set("Authorization", &self.auth_header()?);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+        let resp = req.send_json(body);
         let v: Value = match resp {
             Ok(r) => r
                 .into_json()
@@ -154,9 +172,27 @@ impl RpcClient {
     }
 
     /// Forwarded straight to Core; the descriptor is NEVER persisted or
-    /// logged by the daemon (invariants 5, 6).
+    /// logged by the daemon (invariants 5, 6). Short timeout on purpose:
+    /// `importdescriptors` rescans synchronously and can run for hours on
+    /// mainnet — a timeout here means "rescan started", and the caller
+    /// watches `getwalletinfo.scanning` rather than blocking the daemon.
     pub fn import_descriptors(&self, wallet: &str, requests: Value) -> Result<Value> {
-        self.call(Some(wallet), "importdescriptors", json!([requests]))
+        self.call_with_timeout(
+            Some(wallet),
+            "importdescriptors",
+            json!([requests]),
+            Some(Duration::from_secs(10)),
+        )
+    }
+
+    /// Node-level mempool probe (no wallet context). Ok(true) = the tx is in
+    /// the node's mempool right now; a -5 Node error = it is not.
+    pub fn in_mempool(&self, txid: &str) -> Result<bool> {
+        match self.call(None, "getmempoolentry", json!([txid])) {
+            Ok(_) => Ok(true),
+            Err(RpcError::Node { code: -5, .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Used transiently for gap-limit bumps (the daemon re-reads the

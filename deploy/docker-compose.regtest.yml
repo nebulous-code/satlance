@@ -38,6 +38,9 @@ services:
       SATSURV_DB: /var/lib/satsurv/satsurv.db
       SATSURV_RPC_URL: http://bitcoind:18443
       SATSURV_RPC_COOKIE: /bitcoin/regtest/.cookie
+      # the node advertises its BIND address (0.0.0.0) — subscribe to the
+      # service name instead so the trigger path actually works cross-container
+      SATSURV_ZMQ_ENDPOINTS: tcp://bitcoind:28332,tcp://bitcoind:28333
       SATSURV_BIND: 0.0.0.0:8330   # refused by satsurvd run unless SATSURV_ALLOW_NONLOOPBACK=1
       SATSURV_ALLOW_NONLOOPBACK: "1"  # safe here: bound inside the compose network
       RUST_LOG: info
@@ -45,7 +48,12 @@ services:
     command:
       - |
         until [ -f /bitcoin/regtest/.cookie ]; do echo waiting for bitcoind cookie; sleep 1; done
-        [ -f "$$SATSURV_DB" ] || satsurvd init
+        # bitcoind accepts connections before it finishes warming up (-28),
+        # and init rightly refuses a node it can't fully verify — retry until
+        # the node is actually ready instead of dying on the first attempt
+        until [ -f "$$SATSURV_DB" ] || satsurvd init; do
+          echo "init not ready yet — retrying"; sleep 2
+        done
         exec satsurvd run
     volumes:
       - satsurv-data:/var/lib/satsurv
