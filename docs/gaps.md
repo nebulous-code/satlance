@@ -1,10 +1,36 @@
-# GAPS — independent review findings (2026-06-12)
+# GAPS — defect record
 
-## Resolution ledger (fix pass, same day)
+This file is the permanent record of defects found in Sat 'Lance: what was found, how it was resolved, and what is still open. `docs/STATUS.md` is the milestone-level view; this is the detail behind it.
 
-Everything below was triaged and almost all of it fixed in the follow-up
-commit; the findings text is kept unchanged as the review record. Current
-state:
+Open defects come first. Everything below them is settled history, kept because it explains why parts of the code look the way they do.
+
+## Open
+
+### Multipath descriptors import half-watched (found 2026-08-15)
+
+A descriptor in `<0;1>` multipath notation passes `begin_import`'s ranged check (it contains `*`) but never triggers the change-branch expansion, which only fires on a literal `/0/*`. The result is a single imported descriptor covering the receive branch alone.
+
+Nothing about this looks wrong from the outside. `importdescriptors` returns `success: true`, and the initial observed balance is correct because first funding lands on a receive address — so the arming gate, the defence that catches the R3 class, passes cleanly. The gap opens on the first spend, when change moves to an unwatched branch and silently leaves the watched set. A later theft spending that change never alarms.
+
+Measured against a live signet node with a real Sparrow-exported descriptor: importing the multipath form the way the daemon sends it gives `ismine: true` for a receive address and `ismine: false` for the first change address. Importing `/0/*` plus the synthesised `/1/*` watches both.
+
+This matters more than its size suggests because **multipath is what Sparrow exports by default** — it is the most likely string a real user pastes. It is an R3-class failure and worse in one respect: R3 showed a zero balance a human would question, this shows a correct one.
+
+Workaround: rewrite `/<0;1>/*` to `/0/*` before registering. Fix shape: expand multipath into separate branch descriptors as `/0/*` already is, with the correct `internal` flag per branch — or refuse it by name rather than half-importing it. A `getaddressinfo ismine` check on a derived change address after import would catch this whole class, and may be the better fix.
+
+### The SMTP notifier has never executed
+
+The binary builds and the crate is wired into the workspace, but nothing has ever run it. `deploy/docker-compose.regtest.yml` starts only the ntfy notifier, `deploy/Dockerfile.notifier-smtp` is unused by that harness, and `cargo test` reports zero tests for the crate. This is the same category as R1 — an unexercised seam that reads as green — and it is the escalation path, so it matters most exactly when the primary channel is already down.
+
+The signet stack runs it for the first time. Note that preflighting the relay proves only the transport *downstream* of the notifier; the path is unproven until an alarm or degraded notice reaches a mailbox through the notifier itself.
+
+### No runtime config surface
+
+The `config` table receives its defaults at schema creation and nothing writes it afterwards — there is no `/config` endpoint and no CLI verb. Changing any tunable means a manual `sqlite3` UPDATE against a database the daemon holds open behind a single-writer mutex, which contradicts M3's "no manual DB pokes" done-when and is a poor answer for anyone self-hosting.
+
+## Resolved: the June 2026 review
+
+An independent review on 2026-06-12 read all four crates against the startup prompt and the milestones doc, ran `cargo test`, and executed `scripts/regtest-demo.sh`. It found 24 defects, concentrated in the seams that had never been executed: the ntfy delivery path, the automated descriptor import, and the acceptance harness itself. All were fixed in the same pass except the two noted below. The full findings are preserved further down.
 
 | Finding | State | Where |
 |---|---|---|
@@ -14,7 +40,7 @@ state:
 | R4 harness dies on bitcoind warm-up | **fixed** | compose retries `init` until the node verifies |
 | R5 ZMQ bind-address endpoints | **fixed** | `SATLANCE_ZMQ_ENDPOINTS` override + 0.0.0.0→RPC-host rewrite; compose sets the service name |
 | R6 demo cookie path | **fixed** | `bcli` passes `-datadir`; script assertions strengthened throughout |
-| R7 M7 button auth (new, found during fixes) | **OPEN — design decision** | see below |
+| R7 M7 button auth (new, found during fixes) | **resolved by decision** | see below |
 | D1 spending-tx dedup skip | **fixed** | per-outpoint dedup only; multi-outpoint test added |
 | D2 vanish-by-age silences live spends | **fixed** | vanish needs conflicted/expunged/absent-from-mempool; resurrections reopen `auto_resolved` alarms (never `acknowledged`); decision table unit-tested |
 | D3 backstop COUNT explanation | **fixed** | arithmetic: drop must not exceed summed evented spends (`drop_is_unexplained`, tested) |
@@ -28,26 +54,25 @@ state:
 | C3 silent empty cap token | **fixed** | error log + `cap_token_key_missing` degraded condition |
 | G1 STATUS renumbering | **fixed** | STATUS uses milestones-doc numbers |
 | G2 missing EDGE walkthroughs | **fixed** | design §8.7 added (EDGE 4 = refuse-409) |
-| G3 signet untested | **open (documented)** | noted in STATUS; soak still to do |
+| G3 signet untested | **resolved** | signet stage built: `deploy/docker-compose.signet.yml`, runbook `docs/signet-soak.md`, preflight + daily-check scripts. Soak in progress |
 | Nits (build deps, DB 0600, heartbeat persist, SMTP subject, ntfy Actions, unused import) | **fixed** | README, db.rs, worker.rs, notifier-smtp, notifier-ntfy |
 
-### R7 (new). The M7 phone-button ack cannot authenticate — open design decision
+### R7. The M7 phone-button ack cannot authenticate — resolved by decision
 
-Found while fixing R1: the ntfy action button POSTs
-`/events/{id}/acknowledge` with the capability token, but that endpoint
-(correctly, per invariant 8) also requires the **control-scope secret** —
-which the phone doesn't have, and which must never ride a push payload
-(it would hand the ntfy server the keys to every verb). So the button as
-shipped has always returned `401`. Resolving it means choosing one of:
-(a) accept capability-token-only auth for acknowledge (weakens invariant 8
-to "the token is the second factor *and* the first"), (b) a third
-ack-only credential provisioned to the phone out-of-band, or (c) drop the
-button and keep ack CLI-only until the web UI. Not decided unilaterally —
-needs the designer's call. STATUS marks M7 partial accordingly.
+Found while fixing R1: the ntfy action button POSTs `/events/{id}/acknowledge` with the capability token, but that endpoint (correctly, per invariant 8) also requires the **control-scope secret** — which the phone doesn't have, and which must never ride a push payload, since that would hand the ntfy server the keys to every verb. The button as shipped has always returned `401`.
+
+**Decided 2026-08-15.** The button stays but changes type: an ntfy `view` action deep-linking to the web UI's page for that event, rather than an `http` action POSTing the acknowledge. The human lands in a surface that already holds the control-scope secret and acknowledges there. Invariant 8 is preserved untouched, no new credential or scope is introduced, and a stale notification lands on the event's current state instead of firing a blind acknowledge at something already resolved. Implementation lands with M8, since it depends on a deep-linkable event view.
+
+The two rejected options, recorded because the reasoning constrains future changes:
+
+- **Capability-token-only auth.** The token travels through the ntfy server to reach the phone. Where ntfy runs with default open access, the topic name is the only thing protecting it — so this would make "can read my topic and reach the API" equal to "can silence my theft alarm." Topic names leak in ways secrets do not.
+- **A third ack-only credential on the phone.** Honest two-factor, but it costs a new scope plus provisioning and rotation, and its real-world security reduces to possession of the phone, since the phone would hold both the credential and the token.
 
 ---
 
-# Original review findings (kept verbatim as the record)
+# The June 2026 review — findings as recorded
+
+Kept verbatim. Resolutions are in the table above; the text below is the original record and describes the code as it was on 2026-06-12, not as it is now.
 
 Method: the startup prompt (`docs/startup_docs/agent-startup-prompt.md`) and
 milestones doc were used as the yardstick; every invariant and milestone
@@ -420,7 +445,9 @@ reorgs, mempool behavior — is unstarted and undocumented as a to-do.
 
 ---
 
-## Suggested priority order
+## The order they were fixed in
+
+Recorded for the reasoning, not as outstanding work — all of these are resolved.
 
 1. **R1** — alarm undeliverable via ntfy (the tool's whole job)
 2. **R3 + R2** — automated import arms an empty watch set
@@ -430,4 +457,11 @@ reorgs, mempool behavior — is unstarted and undocumented as a to-do.
 6. **O1** — mainnet import/rescan timeout strands wallets in `error`
 7. **R4 + R6** — make the acceptance harness actually runnable in CI
 8. **D3, D4, O4, C1** — backstop arithmetic, position race, wallet delete, TTL field
-9. Everything else as convenient.
+
+---
+
+## What the pattern says
+
+Every high-severity finding in this file, in both reviews, is the same shape: **a seam that had never been executed.** R1 was the alarm path, R2 and R3 the automated import, R4 through R6 the harness itself, and the multipath defect above is the descriptor form nobody had pasted yet. None of them were subtle logic errors; the unit tests were good and stayed green throughout.
+
+The corollary is that reading code and adding tests does not find these. Running the thing against real infrastructure does — which is the entire argument for the signet soak, and for treating any unexecuted path as unproven no matter how obviously correct it looks.

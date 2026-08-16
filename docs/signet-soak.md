@@ -71,15 +71,25 @@ Re-run it any time you change credentials. It is profile-gated so it never fires
 
 `vanished_timeout_secs` defaults to **1209600 (14 days)**, matching Core's mempool expiry. You cannot exercise the D2 vanish-and-resurrect path inside a soak shorter than that, and D2 was the second-highest-severity finding in the original review.
 
-There is no config verb yet (that is a tracked task), so this is a deliberate, documented DB poke — **with the daemon stopped**, so nothing is writing underneath it:
+The database does not exist until `init` succeeds, so this step comes **after** IBD completes and **before** you register a wallet.
+
+There is no config verb yet (that is a tracked task), so this is a deliberate, documented DB poke — **with the daemon stopped**, because the core holds a single SQLite writer open behind a mutex and editing underneath a live writer is asking for corruption:
 
 ```
-docker compose -f deploy/docker-compose.signet.yml stop core
-docker run --rm -v satlance-signet-core:/d alpine sh -c \
-  'apk add --no-cache sqlite >/dev/null && sqlite3 /d/satlance.db \
-   "UPDATE config SET value='"'"'7200'"'"' WHERE key='"'"'vanished_timeout_secs'"'"';"'
-docker compose -f deploy/docker-compose.signet.yml start core
+C="docker compose -f deploy/docker-compose.signet.yml --env-file deploy/.env"
+
+$C stop core
+
+docker run --rm -i -v satlance-signet-core:/d alpine sh -c \
+  'apk add --no-cache sqlite >/dev/null 2>&1; sqlite3 /d/satlance.db' <<'SQL'
+UPDATE config SET value='7200' WHERE key='vanished_timeout_secs';
+SELECT key || ' = ' || value FROM config WHERE key='vanished_timeout_secs';
+SQL
+
+$C start core
 ```
+
+The heredoc keeps the SQL clear of shell quoting, and the trailing `SELECT` echoes the stored value back so you can see it took rather than assuming it did.
 
 Two hours makes the vanish cycle observable in an afternoon. Leave `heartbeat_secs` at its production value of 21600 (6h) — cadence holding at the real setting is part of what you are testing.
 
