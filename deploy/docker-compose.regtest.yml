@@ -1,4 +1,4 @@
-# Sat Surveillance — regtest harness.
+# Sat Lance — regtest harness.
 #
 # A disposable, fully local stack for exercising the milestone done-when
 # checks (scripts/regtest-demo.sh drives it). STRICTLY separate from any
@@ -35,14 +35,14 @@ services:
     user: root
     depends_on: [bitcoind]
     environment:
-      SATSURV_DB: /var/lib/satsurv/satsurv.db
-      SATSURV_RPC_URL: http://bitcoind:18443
-      SATSURV_RPC_COOKIE: /bitcoin/regtest/.cookie
+      SATLANCE_DB: /var/lib/satlance/satlance.db
+      SATLANCE_RPC_URL: http://bitcoind:18443
+      SATLANCE_RPC_COOKIE: /bitcoin/regtest/.cookie
       # the node advertises its BIND address (0.0.0.0) — subscribe to the
       # service name instead so the trigger path actually works cross-container
-      SATSURV_ZMQ_ENDPOINTS: tcp://bitcoind:28332,tcp://bitcoind:28333
-      SATSURV_BIND: 0.0.0.0:8330   # refused by satsurvd run unless SATSURV_ALLOW_NONLOOPBACK=1
-      SATSURV_ALLOW_NONLOOPBACK: "1"  # safe here: bound inside the compose network
+      SATLANCE_ZMQ_ENDPOINTS: tcp://bitcoind:28332,tcp://bitcoind:28333
+      SATLANCE_BIND: 0.0.0.0:8330   # refused by satlanced run unless SATLANCE_ALLOW_NONLOOPBACK=1
+      SATLANCE_ALLOW_NONLOOPBACK: "1"  # safe here: bound inside the compose network
       RUST_LOG: info
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -51,12 +51,12 @@ services:
         # bitcoind accepts connections before it finishes warming up (-28),
         # and init rightly refuses a node it can't fully verify — retry until
         # the node is actually ready instead of dying on the first attempt
-        until [ -f "$$SATSURV_DB" ] || satsurvd init; do
+        until [ -f "$$SATLANCE_DB" ] || satlanced init; do
           echo "init not ready yet — retrying"; sleep 2
         done
-        exec satsurvd run
+        exec satlanced run
     volumes:
-      - satsurv-data:/var/lib/satsurv
+      - satlance-data:/var/lib/satlance
       - bitcoind-data:/bitcoin:ro
     ports:
       - "127.0.0.1:8330:8330"
@@ -76,23 +76,23 @@ services:
     user: root            # demo only: to read notifier.secret from the shared volume
     depends_on: [core, ntfy]
     environment:
-      SATSURV_API: http://core:8330
-      SATSURV_SECRET_FILE: /var/lib/satsurv/notifier.secret
-      NTFY_URL: http://ntfy:8338/satsurv
+      SATLANCE_API: http://core:8330
+      SATLANCE_SECRET_FILE: /var/lib/satlance/notifier.secret
+      NTFY_URL: http://ntfy:8338/satlance
       NOTIFIER_LABEL: ntfy
       NOTIFIER_TIERS: alarm,degraded,heartbeat
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        until [ -f /var/lib/satsurv/notifier.secret ]; do sleep 1; done
-        exec satsurv-notifier-ntfy
+        until [ -f /var/lib/satlance/notifier.secret ]; do sleep 1; done
+        exec satlance-notifier-ntfy
     volumes:
-      - satsurv-data:/var/lib/satsurv:ro
+      - satlance-data:/var/lib/satlance:ro
     networks: [satnet]
 
 volumes:
   bitcoind-data:
-  satsurv-data:
+  satlance-data:
 
 networks:
   satnet:

@@ -13,7 +13,7 @@ reflects the post-fix state.
 
 | Milestone | State | Notes |
 |---|---|---|
-| M0 skeleton: schema, node connection, init | **done** | schema per §8.2; init refuses IBD (except regtest) and nodes without ZMQ pubs; `SATSURV_ZMQ_ENDPOINTS` override / 0.0.0.0→RPC-host rewrite for cross-host deploys |
+| M0 skeleton: schema, node connection, init | **done** | schema per §8.2; init refuses IBD (except regtest) and nodes without ZMQ pubs; `SATLANCE_ZMQ_ENDPOINTS` override / 0.0.0.0→RPC-host rewrite for cross-host deploys |
 | M1 detection core: ZMQ trigger, RPC decides, event rows | **done** | cookie auth; per-topic sequence-gap detection; RPC-authoritative passes; per-outpoint dedup (one tx spending many watched outpoints events each one) |
 | M2 outbox + first notifier (ntfy) | **done** | fan-out, two-stage ack; ntfy publishes via JSON body (UTF-8 alarm titles deliver — verified on a live regtest run) |
 | M3 HTTP API + CLI + acknowledge + access auth | **done** | role-scoped secrets, 403 on wrong scope; ack = control scope + single-use HMAC capability token; 403 on token reuse |
@@ -72,6 +72,6 @@ fixed, what remains). Standing items:
   async); don't point a load tester at it.
 - Notifier registration is open to anyone holding the notifier secret, and
   the `?label=` identity means one leaked secret can impersonate any
-  notifier. If a secret leaks, `satsurvd rotate-secrets` (daemon stopped)
+  notifier. If a secret leaks, `satlanced rotate-secrets` (daemon stopped)
   regenerates both role secrets and the capability-token key; restart
   notifiers with the new `notifier.secret`.

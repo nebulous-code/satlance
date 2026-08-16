@@ -12,7 +12,7 @@ state:
 | R2 import broken (checksum, label) | **fixed** | checksum stripped before branch expansion; no `label`; non-ranged refused (`descriptor_not_ranged`) |
 | R3 blank wallet arms watching nothing | **fixed** | onboarding requires descriptors in the watch wallet; importing+blank+idle ⇒ `error`; demo asserts observed_sat == funded amount |
 | R4 harness dies on bitcoind warm-up | **fixed** | compose retries `init` until the node verifies |
-| R5 ZMQ bind-address endpoints | **fixed** | `SATSURV_ZMQ_ENDPOINTS` override + 0.0.0.0→RPC-host rewrite; compose sets the service name |
+| R5 ZMQ bind-address endpoints | **fixed** | `SATLANCE_ZMQ_ENDPOINTS` override + 0.0.0.0→RPC-host rewrite; compose sets the service name |
 | R6 demo cookie path | **fixed** | `bcli` passes `-datadir`; script assertions strengthened throughout |
 | R7 M7 button auth (new, found during fixes) | **OPEN — design decision** | see below |
 | D1 spending-tx dedup skip | **fixed** | per-outpoint dedup only; multi-outpoint test added |
@@ -135,9 +135,9 @@ The R2 failure happens **before** `set_state(importing)`, after the blank
 Core wallet was already created. Sequence observed live:
 
 1. `POST /wallets {descriptor}` → begin_import creates blank
-   `satsurv-cold`, fails at getdescriptorinfo → 502; wallet row stays
+   `satlance-cold`, fails at getdescriptorinfo → 502; wallet row stays
    `registered`; blank Core wallet left behind (no cleanup).
-2. `poll_onboarding` sees `satsurv-cold` loaded in Core → logs
+2. `poll_onboarding` sees `satlance-cold` loaded in Core → logs
    *"detected in Core (by-hand path)"* → `importing`.
 3. The blank wallet isn't scanning → "scan complete" → balance **0** →
    `awaiting`.
@@ -155,10 +155,10 @@ in `error`, not `registered`.
 
 ### R4. The compose harness can't survive bitcoind's RPC warm-up
 
-`deploy/docker-compose.regtest.yml` runs `satsurvd init` exactly once,
+`deploy/docker-compose.regtest.yml` runs `satlanced init` exactly once,
 gated only on the cookie file existing. bitcoind accepts connections
 before it finishes warming (`-28 Loading P2P addresses…`), `init`
-correctly refuses (M0 behavior), `satsurvd run` then exits (no DB), the
+correctly refuses (M0 behavior), `satlanced run` then exits (no DB), the
 container dies, and `regtest-demo.sh` polls `/health` forever. Reproduced
 on the first boot. The init-refusal is right; the harness needs a retry
 loop around init (treat `-28` as "wait", as the design's §7 startup-grace
@@ -175,7 +175,7 @@ worker's poll fallback runs every few seconds anyway. Worse, the
 `zmq_silent` degraded condition is suppressed on regtest (`network !=
 "regtest"` guard), so the harness can never notice. On a mainnet docker
 deploy this means permanent "slow mode". Fix: allow an explicit
-`SATSURV_ZMQ_ENDPOINTS` override (and/or rewrite `0.0.0.0`/`127.0.0.1` to
+`SATLANCE_ZMQ_ENDPOINTS` override (and/or rewrite `0.0.0.0`/`127.0.0.1` to
 the RPC URL's host at init).
 
 ### R6. `regtest-demo.sh` cookie path is wrong for the pinned image
@@ -391,7 +391,7 @@ reorgs, mempool behavior — is unstarted and undocumented as a to-do.
   This machine had neither dev package; `cargo test` fails at link with a
   bare `-lsqlite3` error. Either document the apt packages in the README
   or use `rusqlite`'s `bundled` feature.
-- **DB file permissions**: secrets are written 0600, but `satsurv.db`
+- **DB file permissions**: secrets are written 0600, but `satlance.db`
   is created with default umask (typically world-readable). Design §10
   asks for tight permissions on the DB too. (DB contents are
   deliberately low-sensitivity — but the cap-token key lives in `meta`.)

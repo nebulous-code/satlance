@@ -280,13 +280,13 @@ pub fn record_spend(
                     log::error!(
                         "capability token mint FAILED for event {event_id} — \
                          acknowledge will not work until secrets are repaired \
-                         (satsurvd rotate-secrets)"
+                         (satlanced rotate-secrets)"
                     );
                     crate::degraded::raise(
                         conn,
                         "cap_token_key_missing",
                         "The capability-token key is missing from the DB; alarms fire but cannot \
-                         be acknowledged. Run `satsurvd rotate-secrets` (daemon stopped) to repair.",
+                         be acknowledged. Run `satlanced rotate-secrets` (daemon stopped) to repair.",
                     );
                     String::new()
                 }

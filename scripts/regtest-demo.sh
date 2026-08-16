@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sat Surveillance — regtest demo / acceptance run.
+# Sat Lance — regtest demo / acceptance run.
 #
 # Drives the compose harness through the milestone done-when checks:
 #   1. init + health
@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 
 COMPOSE="docker compose -f deploy/docker-compose.regtest.yml"
 API=http://127.0.0.1:8330
-NTFY=http://127.0.0.1:8338/satsurv
+NTFY=http://127.0.0.1:8338/satlance
 
 step() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 # -datadir: the bitcoin/bitcoin image runs the daemon as user 'bitcoin' with
@@ -34,7 +34,7 @@ step "bring up the stack"
 $COMPOSE up -d --build
 until curl -sf "$API/health" >/dev/null 2>&1; do sleep 2; printf .; done
 echo " core is up"
-CTL=$($COMPOSE exec -T core cat /var/lib/satsurv/control.secret)
+CTL=$($COMPOSE exec -T core cat /var/lib/satlance/control.secret)
 
 step "fund a regtest 'cold' wallet (stands in for your cold storage)"
 bcli createwallet spender >/dev/null
@@ -48,7 +48,7 @@ bcli generatetoaddress 1 "$MINE" >/dev/null
 # register from your real wallet (xpub-based, watch-only)
 DESC=$(bcli -rpcwallet=coldsrc listdescriptors | jq -r '.descriptors[] | select(.internal==false and (.desc|startswith("wpkh"))) | .desc' | head -1)
 
-step "register the wallet with satsurv (descriptor forwarded, never stored)"
+step "register the wallet with satlance (descriptor forwarded, never stored)"
 capi POST /wallets "{\"label\":\"cold\",\"descriptor\":$(jq -Rn --arg d "$DESC" '$d')}" | jq .
 WID=1
 

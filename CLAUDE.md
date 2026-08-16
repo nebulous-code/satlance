@@ -8,7 +8,7 @@ keep it honest when you change things.
 
 **Separate deployable units, coupled only by the published HTTP contracts.**
 
-- `satsurv-core` must never know what a delivery channel is. No ntfy, no
+- `satlance-core` must never know what a delivery channel is. No ntfy, no
   SMTP, no webhooks in the core. It writes to the outbox; that's it.
 - Notifiers must be stateless and killable: long-poll `/outbox/pending`,
   deliver, two-stage ack. All durable state lives in the core's SQLite.

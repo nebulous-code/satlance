@@ -1,4 +1,4 @@
-//! satsurv-notifier-ntfy — the loud path.
+//! satlance-notifier-ntfy — the loud path.
 //!
 //! A separate deployable unit (architectural constraint): stateless, speaks
 //! ONLY the published outbox contract (register → long-poll pull → deliver →
@@ -10,8 +10,8 @@
 //! security requires TLS in front of the core via `tailscale serve`).
 //!
 //! Environment:
-//!   SATSURV_API       core base URL          (default http://127.0.0.1:8330)
-//!   SATSURV_SECRET    notifier-scope secret, or SATSURV_SECRET_FILE (default ./notifier.secret)
+//!   SATLANCE_API       core base URL          (default http://127.0.0.1:8330)
+//!   SATLANCE_SECRET    notifier-scope secret, or SATLANCE_SECRET_FILE (default ./notifier.secret)
 //!   NTFY_URL          full topic URL, e.g. https://ntfy.sh/my-secret-topic (required)
 //!   NTFY_TOKEN        optional ntfy auth token
 //!   NOTIFIER_LABEL    identity label          (default "ntfy")
@@ -33,8 +33,8 @@ struct Cfg {
 }
 
 fn cfg() -> Cfg {
-    let secret = std::env::var("SATSURV_SECRET").ok().or_else(|| {
-        let p = std::env::var("SATSURV_SECRET_FILE").unwrap_or_else(|_| "notifier.secret".into());
+    let secret = std::env::var("SATLANCE_SECRET").ok().or_else(|| {
+        let p = std::env::var("SATLANCE_SECRET_FILE").unwrap_or_else(|_| "notifier.secret".into());
         std::fs::read_to_string(p).ok()
     });
     let ntfy_url = std::env::var("NTFY_URL").unwrap_or_default();
@@ -43,9 +43,9 @@ fn cfg() -> Cfg {
         std::process::exit(1);
     }
     Cfg {
-        api: std::env::var("SATSURV_API").unwrap_or_else(|_| "http://127.0.0.1:8330".into()),
+        api: std::env::var("SATLANCE_API").unwrap_or_else(|_| "http://127.0.0.1:8330".into()),
         secret: secret.map(|s| s.trim().to_string()).unwrap_or_else(|| {
-            eprintln!("no notifier secret: set SATSURV_SECRET or SATSURV_SECRET_FILE");
+            eprintln!("no notifier secret: set SATLANCE_SECRET or SATLANCE_SECRET_FILE");
             std::process::exit(1)
         }),
         ntfy_url,
@@ -117,7 +117,7 @@ fn split_topic_url(url: &str) -> Result<(String, String), String> {
 /// emoji and an em-dash (the one message that must never fail to deliver).
 fn deliver(c: &Cfg, payload: &Value) -> Result<(), String> {
     let tier = payload["tier"].as_str().unwrap_or("heartbeat");
-    let title = payload["title"].as_str().unwrap_or("Sat Surveillance");
+    let title = payload["title"].as_str().unwrap_or("Sat Lance");
     let body = payload["body"].as_str().unwrap_or("");
     let (base, topic) = split_topic_url(&c.ntfy_url)?;
 

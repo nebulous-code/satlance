@@ -3,11 +3,11 @@ name = "notifier-ntfy"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "Sat Surveillance ntfy notifier: a stateless egress client of the published outbox contract. Pulls, pushes to ntfy, acks. Issues no verbs."
+description = "Sat Lance ntfy notifier: a stateless egress client of the published outbox contract. Pulls, pushes to ntfy, acks. Issues no verbs."
 license = "MIT"
 
 [[bin]]
-name = "satsurv-notifier-ntfy"
+name = "satlance-notifier-ntfy"
 path = "src/main.rs"
 
 [dependencies]

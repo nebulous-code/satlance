@@ -1,21 +1,21 @@
-//! satsurvd — the Sat Surveillance core daemon.
+//! satlanced — the Sat Lance core daemon.
 //!
 //! Subcommands:
-//!   satsurvd init   verify node (RPC reachable, past IBD, ZMQ publishing),
+//!   satlanced init   verify node (RPC reachable, past IBD, ZMQ publishing),
 //!                   create schema + secrets, write node config to SQLite.
 //!                   CLI-only by design (§11.1): it bootstraps the thing
 //!                   that serves HTTP, so it can't be served by it.
-//!   satsurvd run    start the worker, ZMQ subscriber, and HTTP API.
+//!   satlanced run    start the worker, ZMQ subscriber, and HTTP API.
 //!
 //! Environment:
-//!   SATSURV_DB          path to the SQLite DB    (default ./satsurv.db)
-//!   SATSURV_RPC_URL     node RPC base URL        (init only; persisted)
-//!   SATSURV_RPC_COOKIE  path to the .cookie file (init only; persisted)
-//!   SATSURV_ZMQ_ENDPOINTS  comma-separated ZMQ endpoints to SUBSCRIBE to
+//!   SATLANCE_DB          path to the SQLite DB    (default ./satlance.db)
+//!   SATLANCE_RPC_URL     node RPC base URL        (init only; persisted)
+//!   SATLANCE_RPC_COOKIE  path to the .cookie file (init only; persisted)
+//!   SATLANCE_ZMQ_ENDPOINTS  comma-separated ZMQ endpoints to SUBSCRIBE to
 //!                       (init only; persisted). Overrides what the node
 //!                       advertises — needed when the node's zmqpub bind
 //!                       address (e.g. 0.0.0.0) isn't connectable from here.
-//!   SATSURV_BIND        API bind address         (default 127.0.0.1:8330 —
+//!   SATLANCE_BIND        API bind address         (default 127.0.0.1:8330 —
 //!                       never bind 0.0.0.0; use `tailscale serve` for remote)
 
 mod api;
@@ -51,7 +51,7 @@ fn main() {
         Some("run") => cmd_run(),
         Some("rotate-secrets") => cmd_rotate_secrets(),
         _ => {
-            eprintln!("usage: satsurvd <init|run|rotate-secrets>   (see module docs for env vars)");
+            eprintln!("usage: satlanced <init|run|rotate-secrets>   (see module docs for env vars)");
             2
         }
     };
@@ -62,7 +62,7 @@ fn main() {
 /// existing DB. Old credentials stop working immediately; restart notifiers
 /// with the new notifier.secret. Run while the daemon is stopped.
 fn cmd_rotate_secrets() -> i32 {
-    let db_path = PathBuf::from(env_or("SATSURV_DB", "satsurv.db"));
+    let db_path = PathBuf::from(env_or("SATLANCE_DB", "satlance.db"));
     if !db_path.exists() {
         error!("no DB at {} — run init first", db_path.display());
         return 1;
@@ -93,11 +93,11 @@ fn cmd_rotate_secrets() -> i32 {
 /// init: every check names its failure clearly (M0 done-when) and refuses —
 /// a guard that starts half-connected is worse than one that won't start.
 fn cmd_init() -> i32 {
-    let db_path = PathBuf::from(env_or("SATSURV_DB", "satsurv.db"));
-    let rpc_url = env_or("SATSURV_RPC_URL", "http://127.0.0.1:8332");
-    let cookie = env_or("SATSURV_RPC_COOKIE", "");
+    let db_path = PathBuf::from(env_or("SATLANCE_DB", "satlance.db"));
+    let rpc_url = env_or("SATLANCE_RPC_URL", "http://127.0.0.1:8332");
+    let cookie = env_or("SATLANCE_RPC_COOKIE", "");
     if cookie.is_empty() {
-        error!("init refused: SATSURV_RPC_COOKIE is not set (path to the node's .cookie file)");
+        error!("init refused: SATLANCE_RPC_COOKIE is not set (path to the node's .cookie file)");
         return 1;
     }
 
@@ -149,7 +149,7 @@ fn cmd_init() -> i32 {
     // where the node listens, not where we can connect (from another host or
     // container it points at ourselves). Prefer an explicit override, else
     // rewrite the wildcard host to the RPC URL's host.
-    let endpoints: Vec<String> = match std::env::var("SATSURV_ZMQ_ENDPOINTS") {
+    let endpoints: Vec<String> = match std::env::var("SATLANCE_ZMQ_ENDPOINTS") {
         Ok(s) if !s.trim().is_empty() => s
             .split(',')
             .map(|e| e.trim().to_string())
@@ -198,16 +198,16 @@ fn cmd_init() -> i32 {
     }
     info!(
         "init complete: DB at {}, secrets written beside it (control.secret / notifier.secret, 0600). \
-         Start with `satsurvd run`.",
+         Start with `satlanced run`.",
         db_path.display()
     );
     0
 }
 
 fn cmd_run() -> i32 {
-    let db_path = PathBuf::from(env_or("SATSURV_DB", "satsurv.db"));
+    let db_path = PathBuf::from(env_or("SATLANCE_DB", "satlance.db"));
     if !db_path.exists() {
-        error!("no DB at {} — run `satsurvd init` first", db_path.display());
+        error!("no DB at {} — run `satlanced init` first", db_path.display());
         return 1;
     }
     let conn = match db::open(&db_path) {
@@ -224,7 +224,7 @@ fn cmd_run() -> i32 {
     let rpc_url = match db::meta_get(&conn, "rpc_url") {
         Some(u) => u,
         None => {
-            error!("DB has no node config — run `satsurvd init` first");
+            error!("DB has no node config — run `satlanced init` first");
             return 1;
         }
     };
@@ -234,16 +234,16 @@ fn cmd_run() -> i32 {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let bind = env_or("SATSURV_BIND", "127.0.0.1:8330");
-    if bind.starts_with("0.0.0.0") && env_or("SATSURV_ALLOW_NONLOOPBACK", "0") != "1" {
+    let bind = env_or("SATLANCE_BIND", "127.0.0.1:8330");
+    if bind.starts_with("0.0.0.0") && env_or("SATLANCE_ALLOW_NONLOOPBACK", "0") != "1" {
         // §11: never expose to the LAN/world; remote access is tailscale serve's
-        // job. SATSURV_ALLOW_NONLOOPBACK=1 exists only for container networks
+        // job. SATLANCE_ALLOW_NONLOOPBACK=1 exists only for container networks
         // (compose service-to-service), where "0.0.0.0" is still namespace-private.
-        error!("refusing to bind 0.0.0.0 — bind localhost and use `tailscale serve` for remote access (set SATSURV_ALLOW_NONLOOPBACK=1 only inside an isolated container network)");
+        error!("refusing to bind 0.0.0.0 — bind localhost and use `tailscale serve` for remote access (set SATLANCE_ALLOW_NONLOOPBACK=1 only inside an isolated container network)");
         return 1;
     }
 
-    info!("satsurvd {VERSION} starting: network={network}, db={}", db_path.display());
+    info!("satlanced {VERSION} starting: network={network}, db={}", db_path.display());
 
     let conn = Arc::new(Mutex::new(conn));
     let (tx, rx) = mpsc::channel::<worker::Trigger>();

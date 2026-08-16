@@ -1,4 +1,4 @@
-# Sat Surveillance — Build Milestones (proposed order)
+# Sat 'Lance — Build Milestones (proposed order)
 
 Companion to the design doc. This is **what gets built when** (order, not dates), not how. Each milestone lists its goal, what it builds, what it deliberately does **not** yet cover (the honesty line), what it depends on, and whether it's usable yet.
 

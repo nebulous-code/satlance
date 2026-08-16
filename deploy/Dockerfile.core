@@ -1,4 +1,4 @@
-# satsurvd — core daemon (detection, outbox, control API)
+# satlanced — core daemon (detection, outbox, control API)
 # Separate deployable unit per design §4: knows nothing about delivery channels.
 
 FROM rust:1.75-bookworm AS build
@@ -7,18 +7,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p satsurv-core
+RUN cargo build --release -p satlance-core
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libzmq5 libsqlite3-0 ca-certificates && rm -rf /var/lib/apt/lists/* \
-    && useradd -r -m -d /var/lib/satsurv satsurv
-COPY --from=build /src/target/release/satsurvd /usr/local/bin/satsurvd
-USER satsurv
-WORKDIR /var/lib/satsurv
+    && useradd -r -m -d /var/lib/satlance satlance
+COPY --from=build /src/target/release/satlanced /usr/local/bin/satlanced
+USER satlance
+WORKDIR /var/lib/satlance
 # DB lives on a volume; bind stays loopback-by-default unless overridden
 # inside a trusted network namespace (compose service network, tailscale).
-ENV SATSURV_DB=/var/lib/satsurv/satsurv.db
+ENV SATLANCE_DB=/var/lib/satlance/satlance.db
 EXPOSE 8330
-ENTRYPOINT ["satsurvd"]
+ENTRYPOINT ["satlanced"]
 CMD ["run"]

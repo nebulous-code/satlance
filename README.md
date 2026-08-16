@@ -1,6 +1,8 @@
-# Sat Surveillance
+# Sat 'Lance
 
-A self-hosted tripwire for Bitcoin cold storage. `satsurvd` watches **your
+Short for Sat Surveillance.
+
+A self-hosted tripwire for Bitcoin cold storage. `satlanced` watches **your
 own** Bitcoin Core/Knots node and screams — push notification, email,
 whatever you wire up — the moment any UTXO you've told it to guard moves
 on-chain. Detection and alerting only: **no keys, no signing, no spend
@@ -29,21 +31,21 @@ Three kinds of deployable units, talking only over published HTTP contracts
 (`docs/CONTRACTS.md`):
 
 ```
-bitcoind/knots ──RPC+ZMQ──▶ satsurvd (core daemon)
+bitcoind/knots ──RPC+ZMQ──▶ satlanced (core daemon)
                               │  SQLite: wallets, events, preauths, outbox
                               │
-              control scope ──┤◀── satsurv (CLI), your scripts
-             notifier scope ──┴──▶ satsurv-notifier-ntfy   (push)
-                                   satsurv-notifier-smtp   (email via relay)
+              control scope ──┤◀── satlance (CLI), your scripts
+             notifier scope ──┴──▶ satlance-notifier-ntfy   (push)
+                                   satlance-notifier-smtp   (email via relay)
 ```
 
-- **Core** (`crates/satsurv-core`, binary `satsurvd`): detection, event
+- **Core** (`crates/satlance-core`, binary `satlanced`): detection, event
   lifecycle, escalation, degraded-condition tracking, the outbox, and the
   HTTP API. Channel-blind — it has no idea what ntfy or SMTP are.
 - **Notifiers** (`crates/notifier-*`): stateless. Long-poll the outbox,
   deliver, ack in two stages (`received` → `delivered`). Kill one and
   nothing is lost; the core flags it delinquent if acks go overdue.
-- **CLI** (`crates/satsurv-cli`, binary `satsurv`): a control surface over
+- **CLI** (`crates/satlance-cli`, binary `satlance`): a control surface over
   the same API anyone else could write.
 
 Two bearer secrets are generated at `init` (`control.secret`,
@@ -75,23 +77,23 @@ zmqpubhashblock=tcp://127.0.0.1:28333
 Then:
 
 ```
-SATSURV_RPC_URL=http://127.0.0.1:8332 \
-SATSURV_RPC_COOKIE=~/.bitcoin/.cookie \
-satsurvd init
+SATLANCE_RPC_URL=http://127.0.0.1:8332 \
+SATLANCE_RPC_COOKIE=~/.bitcoin/.cookie \
+satlanced init
 ```
 
 ```
-satsurvd run
+satlanced run
 ```
 
 In another shell (the CLI reads `./control.secret` by default):
 
 ```
-satsurv wallet add cold --descriptor 'wpkh([fingerprint/84h/0h/0h]xpub.../0/*)'
+satlance wallet add cold --descriptor 'wpkh([fingerprint/84h/0h/0h]xpub.../0/*)'
 ```
 
 ```
-satsurv status
+satlance status
 ```
 
 When the import scan finishes, the wallet sits in `awaiting` with an
@@ -99,14 +101,14 @@ observed balance. Verify that number against what you believe you hold,
 then:
 
 ```
-satsurv balance confirm 1 --observed-at <timestamp shown in status>
+satlance balance confirm 1 --observed-at <timestamp shown in status>
 ```
 
 Now it's **armed**. Planning a legitimate spend? Pre-authorize the exact
 outpoint first:
 
 ```
-satsurv preauth add 1 <txid> <vout> --note "moving to new vault"
+satlance preauth add 1 <txid> <vout> --note "moving to new vault"
 ```
 
 The API binds `127.0.0.1:8330` and refuses `0.0.0.0`. For phone access
@@ -127,8 +129,8 @@ spend resolving silently. Requires docker compose, curl, jq.
 
 ## Repo map
 
-- `crates/satsurv-core` — daemon (`satsurvd`)
-- `crates/satsurv-cli` — control CLI (`satsurv`)
+- `crates/satlance-core` — daemon (`satlanced`)
+- `crates/satlance-cli` — control CLI (`satlance`)
 - `crates/notifier-ntfy`, `crates/notifier-smtp` — delivery units
 - `deploy/` — Dockerfiles + regtest compose
 - `docs/` — design spec, `CONTRACTS.md`, `STATUS.md`

@@ -1,13 +1,13 @@
 [package]
-name = "satsurv-core"
+name = "satlance-core"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "Sat Surveillance core daemon: detection, state, outbox, HTTP API. Channel-blind."
+description = "Sat Lance core daemon: detection, state, outbox, HTTP API. Channel-blind."
 license = "MIT"
 
 [[bin]]
-name = "satsurvd"
+name = "satlanced"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,4 +1,4 @@
-//! satsurv-notifier-smtp — the escalation/backup channel.
+//! satlance-notifier-smtp — the escalation/backup channel.
 //!
 //! Same shape as the ntfy notifier: stateless outbox client, no verbs, no
 //! state. Delivery is a minimal hand-rolled SMTP conversation over TCP.
@@ -10,7 +10,7 @@
 //! and avoids shipping credentials over the wire to remote hosts.
 //!
 //! Environment:
-//!   SATSURV_API / SATSURV_SECRET / SATSURV_SECRET_FILE   (as ntfy notifier)
+//!   SATLANCE_API / SATLANCE_SECRET / SATLANCE_SECRET_FILE   (as ntfy notifier)
 //!   SMTP_HOST (default 127.0.0.1)   SMTP_PORT (default 25)
 //!   SMTP_USER / SMTP_PASS           optional AUTH LOGIN (base64'd here)
 //!   SMTP_FROM (required)            SMTP_TO (required)
@@ -35,8 +35,8 @@ struct Cfg {
 }
 
 fn cfg() -> Cfg {
-    let secret = std::env::var("SATSURV_SECRET").ok().or_else(|| {
-        let p = std::env::var("SATSURV_SECRET_FILE").unwrap_or_else(|_| "notifier.secret".into());
+    let secret = std::env::var("SATLANCE_SECRET").ok().or_else(|| {
+        let p = std::env::var("SATLANCE_SECRET_FILE").unwrap_or_else(|_| "notifier.secret".into());
         std::fs::read_to_string(p).ok()
     });
     let req = |k: &str| {
@@ -46,9 +46,9 @@ fn cfg() -> Cfg {
         })
     };
     Cfg {
-        api: std::env::var("SATSURV_API").unwrap_or_else(|_| "http://127.0.0.1:8330".into()),
+        api: std::env::var("SATLANCE_API").unwrap_or_else(|_| "http://127.0.0.1:8330".into()),
         secret: secret.map(|s| s.trim().to_string()).unwrap_or_else(|| {
-            eprintln!("no notifier secret: set SATSURV_SECRET or SATSURV_SECRET_FILE");
+            eprintln!("no notifier secret: set SATLANCE_SECRET or SATLANCE_SECRET_FILE");
             std::process::exit(1)
         }),
         host: std::env::var("SMTP_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
@@ -133,7 +133,7 @@ fn send_mail(c: &Cfg, subject: &str, body: &str) -> Result<(), String> {
     // chars so a hostile wallet label can't inject mail headers.
     let subject: String = subject.chars().filter(|ch| !ch.is_control()).collect();
     let mut s = Smtp::connect(&c.host, c.port)?;
-    s.cmd("EHLO satsurv", 2)?;
+    s.cmd("EHLO satlance", 2)?;
     if let (Some(u), Some(p)) = (&c.user, &c.pass) {
         s.cmd("AUTH LOGIN", 3)?;
         s.cmd(&b64(u.as_bytes()), 3)?;
@@ -149,7 +149,7 @@ fn send_mail(c: &Cfg, subject: &str, body: &str) -> Result<(), String> {
         .collect::<Vec<_>>()
         .join("\r\n");
     let msg = format!(
-        "From: Sat Surveillance <{}>\r\nTo: <{}>\r\nSubject: {}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n.",
+        "From: Sat Lance <{}>\r\nTo: <{}>\r\nSubject: {}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n.",
         c.from, c.to, subject, stuffed
     );
     s.cmd(&msg, 2)?;
@@ -198,11 +198,11 @@ fn main() {
             let delivery_id = d["delivery_id"].as_i64().unwrap_or(-1);
             let _ = core_post(&c, &format!("/outbox/{delivery_id}/received"), json!({"label": c.label}));
             let p = &d["payload"];
-            let subject = p["title"].as_str().unwrap_or("Sat Surveillance");
+            let subject = p["title"].as_str().unwrap_or("Sat Lance");
             let mut body = p["body"].as_str().unwrap_or("").to_string();
             // Email can't render a button; include the ack command instead.
             if let (Some(eid), Some(tok)) = (p["event_id"].as_i64(), p["capability_token"].as_str()) {
-                body.push_str(&format!("\n\nTo acknowledge: satsurv event ack {eid} {tok}\n"));
+                body.push_str(&format!("\n\nTo acknowledge: satlance event ack {eid} {tok}\n"));
             }
             match send_mail(&c, subject, &body) {
                 Ok(()) => {

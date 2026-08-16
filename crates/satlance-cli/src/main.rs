@@ -1,29 +1,29 @@
-//! satsurv — the CLI control surface.
+//! satlance — the CLI control surface.
 //!
 //! A separate deployable unit (architectural constraint): it speaks ONLY the
 //! published control contract over HTTP and holds no state. Anything the CLI
 //! can do, any other control surface (web UI, script) can do identically.
 //!
 //! Environment:
-//!   SATSURV_API     base URL (default http://127.0.0.1:8330)
-//!   SATSURV_SECRET  control-scope secret, or
-//!   SATSURV_SECRET_FILE path to it (default ./control.secret)
+//!   SATLANCE_API     base URL (default http://127.0.0.1:8330)
+//!   SATLANCE_SECRET  control-scope secret, or
+//!   SATLANCE_SECRET_FILE path to it (default ./control.secret)
 
 use serde_json::{json, Value};
 
 fn base() -> String {
-    std::env::var("SATSURV_API").unwrap_or_else(|_| "http://127.0.0.1:8330".into())
+    std::env::var("SATLANCE_API").unwrap_or_else(|_| "http://127.0.0.1:8330".into())
 }
 
 fn secret() -> String {
-    if let Ok(s) = std::env::var("SATSURV_SECRET") {
+    if let Ok(s) = std::env::var("SATLANCE_SECRET") {
         return s.trim().to_string();
     }
-    let path = std::env::var("SATSURV_SECRET_FILE").unwrap_or_else(|_| "control.secret".into());
+    let path = std::env::var("SATLANCE_SECRET_FILE").unwrap_or_else(|_| "control.secret".into());
     match std::fs::read_to_string(&path) {
         Ok(s) => s.trim().to_string(),
         Err(_) => {
-            eprintln!("no control secret: set SATSURV_SECRET or SATSURV_SECRET_FILE (tried '{path}')");
+            eprintln!("no control secret: set SATLANCE_SECRET or SATLANCE_SECRET_FILE (tried '{path}')");
             std::process::exit(1);
         }
     }
@@ -71,7 +71,7 @@ fn fmt_btc(sat: i64) -> String {
     format!("{sign}{}.{:08}", a / 100_000_000, a % 100_000_000)
 }
 
-const USAGE: &str = "usage: satsurv <command>
+const USAGE: &str = "usage: satlance <command>
 
   status                                       daemon + wallet + degraded overview
   wallet add <label> [--core-ref R] [--descriptor D]
@@ -85,7 +85,7 @@ const USAGE: &str = "usage: satsurv <command>
   event list [--firing] | show <id>
   event ack <id> <capability_token>            silence a firing alarm
 
-env: SATSURV_API, SATSURV_SECRET / SATSURV_SECRET_FILE";
+env: SATLANCE_API, SATLANCE_SECRET / SATLANCE_SECRET_FILE";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -174,7 +174,7 @@ fn die_usage() -> ! {
 /// Human-shaped status: the loud NOT PROTECTED section first (invariant 9).
 fn status() {
     let v = call("GET", "/status", None);
-    println!("Sat Surveillance {}", v["version"].as_str().unwrap_or("?"));
+    println!("Sat Lance {}", v["version"].as_str().unwrap_or("?"));
     let node = &v["node"];
     if node["reachable"].as_bool() == Some(true) {
         println!(
@@ -210,7 +210,7 @@ fn status() {
     }
     if let Some(f) = v["firing_events"].as_i64() {
         if f > 0 {
-            println!("\n{f} alarm(s) FIRING — `satsurv event list --firing`");
+            println!("\n{f} alarm(s) FIRING — `satlance event list --firing`");
         }
     }
     let uncovered = v["uncovered_tiers"].as_array().cloned().unwrap_or_default();

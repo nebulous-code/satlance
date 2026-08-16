@@ -1,10 +1,10 @@
-# Startup Prompt — Sat Surveillance
+# Startup Prompt — Sat 'Lance
 
 Paste this at the start of a build session. It orients you and lists the rules you must not violate. Two companion documents define the full design and build order; read them before writing code.
 
 ## What you're building
 
-**Sat Surveillance** is a self-hosted daemon that watches a user's own Bitcoin node (Core or Knots) for any spend of a UTXO they control, and alerts them in real time — so an unauthorized movement of cold-storage funds is caught within seconds. It is **detection and alerting only**: it holds no keys, signs nothing, and never constructs transactions. The node's watch-only wallet is the source of truth for what's watched; the daemon adds detection, alert delivery, and accountability around it.
+**Sat 'Lance** is a self-hosted daemon that watches a user's own Bitcoin node (Core or Knots) for any spend of a UTXO they control, and alerts them in real time — so an unauthorized movement of cold-storage funds is caught within seconds. It is **detection and alerting only**: it holds no keys, signs nothing, and never constructs transactions. The node's watch-only wallet is the source of truth for what's watched; the daemon adds detection, alert delivery, and accountability around it.
 
 ## How to read the docs
 

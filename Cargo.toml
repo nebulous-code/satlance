@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/satsurv-core",
-    "crates/satsurv-cli",
+    "crates/satlance-core",
+    "crates/satlance-cli",
     "crates/notifier-ntfy",
     "crates/notifier-smtp",
 ]

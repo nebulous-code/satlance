@@ -285,7 +285,7 @@ fn escalation_sweep(conn: &Connection) {
                 conn,
                 "cap_token_key_missing",
                 "The capability-token key is missing from the DB; alarms fire but cannot \
-                 be acknowledged. Run `satsurvd rotate-secrets` (daemon stopped) to repair.",
+                 be acknowledged. Run `satlanced rotate-secrets` (daemon stopped) to repair.",
             );
         }
         let p = outbox::payload(
@@ -349,9 +349,9 @@ fn heartbeat(conn: &Connection) {
     }
 
     let title = if degraded_active {
-        "Sat Surveillance heartbeat — DEGRADED"
+        "Sat Lance heartbeat — DEGRADED"
     } else {
-        "Sat Surveillance heartbeat"
+        "Sat Lance heartbeat"
     };
     let p = outbox::payload(
         outbox::TIER_HEARTBEAT,

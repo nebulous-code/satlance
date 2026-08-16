@@ -299,7 +299,7 @@ fn post_wallet(ctx: &Ctx, body: &Value) -> (u16, Value) {
     let core_ref = body["core_wallet_ref"]
         .as_str()
         .map(str::to_string)
-        .unwrap_or_else(|| format!("satsurv-{label}"));
+        .unwrap_or_else(|| format!("satlance-{label}"));
     let conn = ctx.conn.lock().unwrap();
     let id = match arming::register(&conn, label, &core_ref) {
         Ok(id) => id,

@@ -523,7 +523,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "satsurv-cli"
+name = "satlance-cli"
 version = "0.1.0"
 dependencies = [
  "serde_json",
@@ -531,7 +531,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "satsurv-core"
+name = "satlance-core"
 version = "0.1.0"
 dependencies = [
  "env_logger",

@@ -89,7 +89,7 @@ impl RpcClient {
             Some(w) => format!("{}/wallet/{}", self.url, w),
             None => self.url.clone(),
         };
-        let body = json!({"jsonrpc": "1.0", "id": "satsurv", "method": method, "params": params});
+        let body = json!({"jsonrpc": "1.0", "id": "satlance", "method": method, "params": params});
         let mut req = self
             .agent
             .post(&url)

@@ -1,13 +1,13 @@
 [package]
-name = "satsurv-cli"
+name = "satlance-cli"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "Sat Surveillance control surface: a thin client over the published control contract (HTTP). Holds no state; the core owns everything."
+description = "Sat Lance control surface: a thin client over the published control contract (HTTP). Holds no state; the core owns everything."
 license = "MIT"
 
 [[bin]]
-name = "satsurv"
+name = "satlance"
 path = "src/main.rs"
 
 [dependencies]

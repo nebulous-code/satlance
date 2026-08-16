@@ -1,4 +1,4 @@
-# satsurv-notifier-ntfy — stateless delivery unit (push via ntfy)
+# satlance-notifier-ntfy — stateless delivery unit (push via ntfy)
 # Talks to the core only over the published outbox HTTP contract.
 
 FROM rust:1.75-bookworm AS build
@@ -10,6 +10,6 @@ RUN cargo build --release -p notifier-ntfy
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates && rm -rf /var/lib/apt/lists/* && useradd -r notifier
-COPY --from=build /src/target/release/satsurv-notifier-ntfy /usr/local/bin/
+COPY --from=build /src/target/release/satlance-notifier-ntfy /usr/local/bin/
 USER notifier
-ENTRYPOINT ["satsurv-notifier-ntfy"]
+ENTRYPOINT ["satlance-notifier-ntfy"]

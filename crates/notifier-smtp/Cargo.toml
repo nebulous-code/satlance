@@ -3,11 +3,11 @@ name = "notifier-smtp"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "Sat Surveillance SMTP notifier: a stateless egress client of the published outbox contract. Pulls, emails, acks. Issues no verbs."
+description = "Sat Lance SMTP notifier: a stateless egress client of the published outbox contract. Pulls, emails, acks. Issues no verbs."
 license = "MIT"
 
 [[bin]]
-name = "satsurv-notifier-smtp"
+name = "satlance-notifier-smtp"
 path = "src/main.rs"
 
 [dependencies]

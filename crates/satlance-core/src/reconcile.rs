@@ -46,7 +46,7 @@ pub fn prompt_confirm(
         &format!("Confirm balance for '{label}'"),
         &format!(
             "{context} Observed balance: {} BTC ({sat} sat). \
-             Confirm with: satsurv balance confirm {wallet_id} --observed-at {observed_at}",
+             Confirm with: satlance balance confirm {wallet_id} --observed-at {observed_at}",
             format_btc(sat)
         ),
         Some(label),
@@ -430,7 +430,7 @@ mod tests {
     fn add_wallet(c: &Connection, label: &str, state: &str) -> i64 {
         c.execute(
             "INSERT INTO wallet(label,core_wallet_ref,arming_state,added_at) VALUES(?1,?2,?3,0)",
-            params![label, format!("satsurv-{label}"), state],
+            params![label, format!("satlance-{label}"), state],
         )
         .unwrap();
         c.last_insert_rowid()
