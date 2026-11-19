@@ -37,9 +37,31 @@ pub enum Trigger {
 
 const TICK_SECS: u64 = 30;
 
+/// What a tip change says about ZMQ health, if anything.
+///
+/// `None` means "no conclusion": either no block arrived, or this is the
+/// first tip we have recorded and we cannot know whether ZMQ announced it.
+/// `Some(true)` means a block arrived that ZMQ never announced.
+///
+/// Deliberately says nothing about elapsed time. Silence on a quiet chain is
+/// correct behaviour, not a fault (invariant 2: ZMQ triggers, RPC decides —
+/// a missed message may delay, never corrupt).
+pub(crate) fn zmq_observation(
+    last_seen_tip: &str,
+    tip: &str,
+    zmq_since_tip_change: bool,
+) -> Option<bool> {
+    if tip.is_empty() || tip == last_seen_tip || last_seen_tip.is_empty() {
+        return None;
+    }
+    Some(!zmq_since_tip_change)
+}
+
 pub fn run(conn: Arc<Mutex<Connection>>, rpc: RpcClient, network: String, rx: Receiver<Trigger>) {
     info!("worker: started (tick {}s)", TICK_SECS);
-    let mut last_zmq_msg = timeutil::now();
+    // ZMQ health is tracked per BLOCK, not per second (see the check below).
+    let mut last_seen_tip = String::new();
+    let mut zmq_since_tip_change = false;
     let mut last_duties: i64 = 0;
     let mut last_backstop: i64 = 0;
     let mut last_degraded_recheck: i64 = 0;
@@ -89,7 +111,7 @@ pub fn run(conn: Arc<Mutex<Connection>>, rpc: RpcClient, network: String, rx: Re
         }
         let now = timeutil::now();
         if zmq_activity {
-            last_zmq_msg = now;
+            zmq_since_tip_change = true;
         }
         let followup_due = followup_at.map_or(false, |t| now >= t);
         // The ZMQ thread's 5s recv timeout sends ZmqIdle just to keep this
@@ -146,17 +168,38 @@ pub fn run(conn: Arc<Mutex<Connection>>, rpc: RpcClient, network: String, rx: Re
             degraded::delinquency_sweep(&conn);
             degraded::coverage_sweep(&conn);
             degraded::renotify_sweep(&conn);
-            // ZMQ silence: no message in 3 ticks while the node is fine and
-            // blocks should be flowing → slow mode (RPC poll still covers us).
-            let silence = now - last_zmq_msg;
-            if node_ok && silence > (TICK_SECS as i64) * 3 && network != "regtest" {
-                degraded::raise(
-                    &conn,
-                    "zmq_silent",
-                    "No ZMQ messages received recently. Falling back to RPC polling (higher latency; detection still covered by the periodic pass).",
-                );
-            } else if degraded::is_active(&conn, "zmq_silent") && (zmq_activity || network == "regtest") {
-                degraded::clear(&conn, "zmq_silent", "ZMQ trigger path is live again.");
+            // ZMQ health, judged per block rather than per second.
+            //
+            // The old check raised after 3 quiet ticks (90s). But ZMQ message
+            // arrival is driven by chain and mempool activity, which varies by
+            // orders of magnitude between networks: on mainnet 90s of silence
+            // means something broke, while on signet the mean block gap is
+            // ~10min and quiet is the normal state. A signet soak produced 38
+            // raise/clear pairs in two weeks, none of them real.
+            //
+            // The useful question is not "has ZMQ been quiet" but "did ZMQ
+            // tell us about the blocks RPC can see". A block arriving without
+            // a matching trigger is a genuine trigger-path failure on any
+            // network; no block arriving is not evidence of anything. This
+            // also detects a dead ZMQ faster than a timeout would, since it
+            // fires on the first block rather than after a fixed wait.
+            if node_ok && network != "regtest" {
+                let tip = db::meta_get(&conn, "last_block_hash").unwrap_or_default();
+                if let Some(missed) = zmq_observation(&last_seen_tip, &tip, zmq_since_tip_change) {
+                    let need = db::config_get_i64(&conn, "zmq_missed_blocks");
+                    degraded::observe(
+                        &conn,
+                        "zmq_silent",
+                        missed,
+                        "Blocks are arriving without ZMQ announcing them. Falling back to RPC polling (higher latency; detection still covered by the periodic pass).",
+                        "ZMQ trigger path is live again.",
+                        need,
+                    );
+                }
+                if !tip.is_empty() && tip != last_seen_tip {
+                    last_seen_tip = tip;
+                    zmq_since_tip_change = false;
+                }
             }
             last_degraded_recheck = now;
         }
@@ -460,5 +503,57 @@ mod tests {
         };
         assert!(payloads[0].contains("STATUS: OK"));
         assert!(payloads[1].contains("DEGRADED"));
+    }
+
+    #[test]
+    fn zmq_health_is_judged_per_block_not_per_second() {
+        // A quiet chain says nothing either way. This is the whole bug: the
+        // old check raised after 90s of silence, and signet's mean block gap
+        // is ~10min, so it fired constantly while nothing was wrong.
+        assert_eq!(zmq_observation("aa", "aa", false), None, "no new block = no conclusion");
+        assert_eq!(zmq_observation("", "aa", false), None, "first tip seen = no conclusion");
+        assert_eq!(zmq_observation("aa", "", false), None, "no tip = no conclusion");
+
+        // A block that arrived without a trigger is a real failure, on any
+        // network, and is caught on the first block rather than after a wait.
+        assert_eq!(zmq_observation("aa", "bb", false), Some(true));
+        // A block the trigger path announced is health.
+        assert_eq!(zmq_observation("aa", "bb", true), Some(false));
+    }
+
+    #[test]
+    fn degraded_observe_debounces_both_directions() {
+        let c = mem();
+        let need = 2;
+
+        // One observation is not enough to page anyone.
+        degraded::observe(&c, "zmq_silent", true, "d", "r", need);
+        assert!(!degraded::is_active(&c, "zmq_silent"), "single blip must not raise");
+
+        // Two in a row is a real condition.
+        degraded::observe(&c, "zmq_silent", true, "d", "r", need);
+        assert!(degraded::is_active(&c, "zmq_silent"));
+
+        // One good observation must not clear it either.
+        degraded::observe(&c, "zmq_silent", false, "d", "r", need);
+        assert!(degraded::is_active(&c, "zmq_silent"), "single recovery must not clear");
+
+        degraded::observe(&c, "zmq_silent", false, "d", "r", need);
+        assert!(!degraded::is_active(&c, "zmq_silent"));
+    }
+
+    #[test]
+    fn flapping_observations_never_raise() {
+        // The signet soak produced 38 raise/clear pairs, none real. Alternating
+        // observations must produce exactly zero notifications.
+        let c = mem();
+        for i in 0..20 {
+            degraded::observe(&c, "zmq_silent", i % 2 == 0, "d", "r", 3);
+            assert!(!degraded::is_active(&c, "zmq_silent"), "flapping raised at i={i}");
+        }
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "flapping must not enqueue any notification");
     }
 }

@@ -114,6 +114,16 @@ CREATE TABLE IF NOT EXISTS degraded (
     last_notified_at INTEGER
 );
 
+-- Debounce state for degraded conditions (§7.1). A condition must be observed
+-- the same way N times running before it raises or clears; without it a single
+-- transient blip emits a DEGRADED push and a Recovered push back to back,
+-- which trains the operator to ignore the tier that matters most.
+CREATE TABLE IF NOT EXISTS degraded_observation (
+    key     TEXT PRIMARY KEY,
+    present INTEGER NOT NULL,   -- 1 = condition observed present, 0 = absent
+    streak  INTEGER NOT NULL    -- consecutive observations in that direction
+);
+
 -- Registered notifiers (egress clients). Identity + tiers + ack promise.
 CREATE TABLE IF NOT EXISTS notifier (
     id              INTEGER PRIMARY KEY,
@@ -193,6 +203,12 @@ pub const CONFIG_DEFAULTS: &[(&str, &str)] = &[
     ("notifier_default_ack_window_secs", "300"),
     ("outbox_longpoll_secs", "25"),
     ("node_grace_secs", "30"),            // ride out a node restart before 'blinded'
+    // Consecutive same-direction observations before a degraded condition
+    // raises or clears (generic debounce; see degraded::observe).
+    ("degraded_confirm_ticks", "3"),
+    // ZMQ health is judged per BLOCK, not per second: this many consecutive
+    // blocks seen by RPC but not announced by ZMQ before declaring slow mode.
+    ("zmq_missed_blocks", "2"),
     // §14 minor decision, default chosen: benign authorized spends ARE logged
     // as events (auto_resolved) — audit trail over minimalism, consistent with
     // §13 "keep resolved events indefinitely (audit trail)".

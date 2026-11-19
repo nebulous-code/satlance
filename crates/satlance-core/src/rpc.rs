@@ -90,25 +90,49 @@ impl RpcClient {
             None => self.url.clone(),
         };
         let body = json!({"jsonrpc": "1.0", "id": "satlance", "method": method, "params": params});
-        let mut req = self
-            .agent
-            .post(&url)
-            .set("Authorization", &self.auth_header()?);
-        if let Some(t) = timeout {
-            req = req.timeout(t);
+
+        // Transient transport failures are routine against a local node: an
+        // idle keepalive connection the node has already closed surfaces as an
+        // "Unexpected EOF" on next use, which is common on a quiet chain where
+        // the connection sits unused between blocks. Treating that as "node
+        // unreachable" blinds every armed wallet and pages the operator over a
+        // dropped socket — so try once more before believing it.
+        //
+        // Only on the default path. Callers that pass an explicit timeout use
+        // it as a signal rather than a failure ("the node took the job" —
+        // importdescriptors kicking off an hours-long rescan, §5.3), and
+        // re-issuing those would be wrong.
+        let attempts = if timeout.is_some() { 1 } else { 2 };
+        let mut v: Value = Value::Null;
+        for attempt in 0..attempts {
+            let mut req = self
+                .agent
+                .post(&url)
+                .set("Authorization", &self.auth_header()?);
+            if let Some(t) = timeout {
+                req = req.timeout(t);
+            }
+            match req.send_json(body.clone()) {
+                Ok(r) => {
+                    v = r.into_json().map_err(|e| RpcError::Protocol(e.to_string()))?;
+                    break;
+                }
+                // ureq returns Err for HTTP >= 400, but bitcoind sends RPC
+                // errors with 500 — recover the body in that case. A node that
+                // answers at all is reachable; never retry these.
+                Err(ureq::Error::Status(_, r)) => {
+                    v = r.into_json().map_err(|e| RpcError::Protocol(e.to_string()))?;
+                    break;
+                }
+                Err(ureq::Error::Transport(t)) => {
+                    if attempt + 1 < attempts {
+                        std::thread::sleep(Duration::from_millis(250));
+                        continue;
+                    }
+                    return Err(RpcError::Transport(t.to_string()));
+                }
+            }
         }
-        let resp = req.send_json(body);
-        let v: Value = match resp {
-            Ok(r) => r
-                .into_json()
-                .map_err(|e| RpcError::Protocol(e.to_string()))?,
-            // ureq returns Err for HTTP >= 400, but bitcoind sends RPC errors
-            // with 500 — recover the body in that case.
-            Err(ureq::Error::Status(_, r)) => r
-                .into_json()
-                .map_err(|e| RpcError::Protocol(e.to_string()))?,
-            Err(ureq::Error::Transport(t)) => return Err(RpcError::Transport(t.to_string())),
-        };
         if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
             return Err(RpcError::Node {
                 code: err.get("code").and_then(Value::as_i64).unwrap_or(0),

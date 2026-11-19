@@ -45,6 +45,45 @@ pub fn raise(conn: &Connection, key: &str, detail: &str) {
     let _ = outbox::enqueue(conn, outbox::TIER_DEGRADED, "degraded_raised", None, None, &p);
 }
 
+/// Debounced transition (§7.1). A condition must be observed the same way
+/// `need` times running before it raises or clears.
+///
+/// Without this, one transient blip costs the operator two pushes — DEGRADED
+/// then Recovered — on the tier reserved for real coverage loss. A soak on
+/// signet produced 38 such pairs in two weeks, none of which reflected a real
+/// problem. Alert fatigue on the degraded tier is not cosmetic: it is how a
+/// genuine coverage gap gets ignored.
+///
+/// `need` is per-condition on purpose. Wall-clock conditions want a tick
+/// count; event-driven ones (see the ZMQ check in `worker`) want a count of
+/// the events themselves.
+pub fn observe(conn: &Connection, key: &str, present: bool, detail: &str, recovery: &str, need: i64) {
+    let want = i64::from(present);
+    let (prev, prev_streak): (i64, i64) = conn
+        .query_row(
+            "SELECT present, streak FROM degraded_observation WHERE key=?1",
+            [key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((-1, 0));
+    let streak = if prev == want { prev_streak + 1 } else { 1 };
+    let _ = conn.execute(
+        "INSERT INTO degraded_observation(key,present,streak) VALUES(?1,?2,?3)
+         ON CONFLICT(key) DO UPDATE SET present=excluded.present, streak=excluded.streak",
+        params![key, want, streak],
+    );
+    if streak < need.max(1) {
+        return;
+    }
+    // raise is idempotent and clear no-ops when absent, so staying past the
+    // threshold is free.
+    if present {
+        raise(conn, key, detail);
+    } else {
+        clear(conn, key, recovery);
+    }
+}
+
 /// Clear a condition. One-shot recovery notice (config `recovery_notice`).
 pub fn clear(conn: &Connection, key: &str, recovery_detail: &str) {
     let removed = conn
